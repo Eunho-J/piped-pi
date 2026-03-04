@@ -12,6 +12,68 @@ class TestComponent implements Component {
 	invalidate(): void {}
 }
 
+class RecordingTerminal {
+	public writes: string[] = [];
+	private _columns: number;
+	private _rows: number;
+
+	constructor(columns = 80, rows = 24) {
+		this._columns = columns;
+		this._rows = rows;
+	}
+
+	start(_onInput: (data: string) => void, _onResize: () => void): void {}
+	stop(): void {}
+	async drainInput(_maxMs?: number, _idleMs?: number): Promise<void> {}
+	write(data: string): void {
+		this.writes.push(data);
+	}
+	get columns(): number {
+		return this._columns;
+	}
+	get rows(): number {
+		return this._rows;
+	}
+	get kittyProtocolActive(): boolean {
+		return false;
+	}
+	moveBy(_lines: number): void {}
+	hideCursor(): void {}
+	showCursor(): void {}
+	clearLine(): void {}
+	clearFromCursor(): void {}
+	clearScreen(): void {}
+	setTitle(_title: string): void {}
+}
+
+async function waitForRender(): Promise<void> {
+	return new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+async function withTemporaryEnv(updates: Record<string, string | undefined>, fn: () => Promise<void>): Promise<void> {
+	const original: Record<string, string | undefined> = {};
+	for (const [key, value] of Object.entries(updates)) {
+		original[key] = process.env[key];
+		if (value === undefined) {
+			delete process.env[key];
+		} else {
+			process.env[key] = value;
+		}
+	}
+
+	try {
+		await fn();
+	} finally {
+		for (const [key, value] of Object.entries(original)) {
+			if (value === undefined) {
+				delete process.env[key];
+			} else {
+				process.env[key] = value;
+			}
+		}
+	}
+}
+
 function getCellItalic(terminal: VirtualTerminal, row: number, col: number): number {
 	const xterm = (terminal as unknown as { xterm: XtermTerminalType }).xterm;
 	const buffer = xterm.buffer.active;
@@ -43,6 +105,59 @@ describe("TUI resize handling", () => {
 		assert.ok(tui.fullRedraws > initialRedraws, "Width change should trigger full redraw");
 
 		tui.stop();
+	});
+});
+
+describe("TUI safe render mode", () => {
+	it("uses a defensive render path by default on Apple Terminal", async () => {
+		await withTemporaryEnv(
+			{
+				TERM_PROGRAM: "Apple_Terminal",
+				PI_TUI_SAFE_MODE: undefined,
+			},
+			async () => {
+				const terminal = new RecordingTerminal(40, 10);
+				const tui = new TUI(terminal);
+				const component = new TestComponent();
+				component.lines = ["/skill 한글 입력"];
+				tui.addChild(component);
+
+				tui.start();
+				await waitForRender();
+				tui.stop();
+
+				const output = terminal.writes.join("");
+				assert.ok(!output.includes("\x1b[?2026h"));
+				assert.ok(!output.includes("\x1b[?2026l"));
+				assert.ok(!output.includes("\x1b]8;;\x07"));
+				assert.ok(output.includes("/skill 한글 입력"));
+			},
+		);
+	});
+
+	it("can force legacy render path on Apple Terminal via PI_TUI_SAFE_MODE=0", async () => {
+		await withTemporaryEnv(
+			{
+				TERM_PROGRAM: "Apple_Terminal",
+				PI_TUI_SAFE_MODE: "0",
+			},
+			async () => {
+				const terminal = new RecordingTerminal(40, 10);
+				const tui = new TUI(terminal);
+				const component = new TestComponent();
+				component.lines = ["legacy render test"];
+				tui.addChild(component);
+
+				tui.start();
+				await waitForRender();
+				tui.stop();
+
+				const output = terminal.writes.join("");
+				assert.ok(output.includes("\x1b[?2026h"));
+				assert.ok(output.includes("\x1b[?2026l"));
+				assert.ok(output.includes("\x1b]8;;\x07"));
+			},
+		);
 	});
 });
 

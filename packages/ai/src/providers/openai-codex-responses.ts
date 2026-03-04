@@ -27,6 +27,7 @@ import { buildBaseOptions, clampReasoning } from "./simple-options.js";
 // ============================================================================
 
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
+const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const JWT_CLAIM_PATH = "https://api.openai.com/auth" as const;
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
@@ -67,8 +68,20 @@ interface RequestBody {
 	text?: { verbosity?: string };
 	include?: string[];
 	prompt_cache_key?: string;
+	prompt_cache_retention?: "in-memory";
 	[key: string]: unknown;
 }
+
+type CodexAuthMode = "chatgpt-plan-oauth" | "openai-api-key";
+
+type ResolvedCodexAuth =
+	| {
+			mode: "chatgpt-plan-oauth";
+			accountId: string;
+	  }
+	| {
+			mode: "openai-api-key";
+	  };
 
 // ============================================================================
 // Retry Helpers
@@ -131,18 +144,27 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				throw new Error(`No API key for provider: ${model.provider}`);
 			}
 
-			const accountId = extractAccountId(apiKey);
+			const auth = resolveCodexAuth(apiKey);
 			const body = buildRequestBody(model, context, options);
 			options?.onPayload?.(body);
-			const headers = buildHeaders(model.headers, options?.headers, accountId, apiKey, options?.sessionId);
+			const headers = buildHeaders(model.headers, options?.headers, auth, apiKey, options?.sessionId);
 			const bodyJson = JSON.stringify(body);
-			const transport = options?.transport || "sse";
+			const requestUrl = resolveCodexUrl(model.baseUrl, auth.mode);
+			const requestedTransport = options?.transport || "sse";
+
+			if (auth.mode === "openai-api-key" && requestedTransport === "websocket") {
+				throw new Error(
+					"WebSocket transport requires ChatGPT Plan OAuth. Use /login openai-codex or use transport=sse/auto.",
+				);
+			}
+
+			const transport = auth.mode === "chatgpt-plan-oauth" ? requestedTransport : "sse";
 
 			if (transport !== "sse") {
 				let websocketStarted = false;
 				try {
 					await processWebSocketStream(
-						resolveCodexWebSocketUrl(model.baseUrl),
+						resolveCodexWebSocketUrl(model.baseUrl, auth.mode),
 						body,
 						headers,
 						output,
@@ -181,7 +203,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				}
 
 				try {
-					response = await fetch(resolveCodexUrl(model.baseUrl), {
+					response = await fetch(requestUrl, {
 						method: "POST",
 						headers,
 						body: bodyJson,
@@ -204,7 +226,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 						status: response.status,
 						statusText: response.statusText,
 					});
-					const info = await parseErrorResponse(fakeResponse);
+					const info = await parseErrorResponse(fakeResponse, auth.mode);
 					throw new Error(info.friendlyMessage || info.message);
 				} catch (error) {
 					if (error instanceof Error) {
@@ -292,6 +314,7 @@ function buildRequestBody(
 		text: { verbosity: options?.textVerbosity || "medium" },
 		include: ["reasoning.encrypted_content"],
 		prompt_cache_key: options?.sessionId,
+		prompt_cache_retention: options?.sessionId ? "in-memory" : undefined,
 		tool_choice: "auto",
 		parallel_tool_calls: true,
 	};
@@ -322,7 +345,13 @@ function clampReasoningEffort(modelId: string, effort: string): string {
 	return effort;
 }
 
-function resolveCodexUrl(baseUrl?: string): string {
+function resolveCodexUrl(baseUrl: string | undefined, mode: CodexAuthMode): string {
+	if (mode === "openai-api-key") {
+		const normalized = DEFAULT_OPENAI_BASE_URL.replace(/\/+$/, "");
+		if (normalized.endsWith("/responses")) return normalized;
+		return `${normalized}/responses`;
+	}
+
 	const raw = baseUrl && baseUrl.trim().length > 0 ? baseUrl : DEFAULT_CODEX_BASE_URL;
 	const normalized = raw.replace(/\/+$/, "");
 	if (normalized.endsWith("/codex/responses")) return normalized;
@@ -330,8 +359,12 @@ function resolveCodexUrl(baseUrl?: string): string {
 	return `${normalized}/codex/responses`;
 }
 
-function resolveCodexWebSocketUrl(baseUrl?: string): string {
-	const url = new URL(resolveCodexUrl(baseUrl));
+function resolveCodexWebSocketUrl(baseUrl: string | undefined, mode: CodexAuthMode): string {
+	if (mode !== "chatgpt-plan-oauth") {
+		throw new Error("WebSocket transport is only available with ChatGPT Plan OAuth authentication.");
+	}
+
+	const url = new URL(resolveCodexUrl(baseUrl, mode));
 	if (url.protocol === "https:") url.protocol = "wss:";
 	if (url.protocol === "http:") url.protocol = "ws:";
 	return url.toString();
@@ -791,7 +824,10 @@ async function processWebSocketStream(
 // Error Handling
 // ============================================================================
 
-async function parseErrorResponse(response: Response): Promise<{ message: string; friendlyMessage?: string }> {
+async function parseErrorResponse(
+	response: Response,
+	mode: CodexAuthMode,
+): Promise<{ message: string; friendlyMessage?: string }> {
 	const raw = await response.text();
 	let message = raw || response.statusText || "Request failed";
 	let friendlyMessage: string | undefined;
@@ -809,7 +845,8 @@ async function parseErrorResponse(response: Response): Promise<{ message: string
 					? Math.max(0, Math.round((err.resets_at * 1000 - Date.now()) / 60000))
 					: undefined;
 				const when = mins !== undefined ? ` Try again in ~${mins} min.` : "";
-				friendlyMessage = `You have hit your ChatGPT usage limit${plan}.${when}`.trim();
+				const providerLabel = mode === "chatgpt-plan-oauth" ? "ChatGPT" : "OpenAI API";
+				friendlyMessage = `You have hit your ${providerLabel} usage limit${plan}.${when}`.trim();
 			}
 			message = err.message || friendlyMessage || message;
 		}
@@ -822,31 +859,42 @@ async function parseErrorResponse(response: Response): Promise<{ message: string
 // Auth & Headers
 // ============================================================================
 
-function extractAccountId(token: string): string {
+function tryExtractAccountId(token: string): string | undefined {
 	try {
 		const parts = token.split(".");
-		if (parts.length !== 3) throw new Error("Invalid token");
+		if (parts.length !== 3) return undefined;
 		const payload = JSON.parse(atob(parts[1]));
 		const accountId = payload?.[JWT_CLAIM_PATH]?.chatgpt_account_id;
-		if (!accountId) throw new Error("No account ID in token");
-		return accountId;
+		return typeof accountId === "string" && accountId.length > 0 ? accountId : undefined;
 	} catch {
-		throw new Error("Failed to extract accountId from token");
+		return undefined;
 	}
+}
+
+function resolveCodexAuth(token: string): ResolvedCodexAuth {
+	const accountId = tryExtractAccountId(token);
+	if (accountId) {
+		return { mode: "chatgpt-plan-oauth", accountId };
+	}
+	return { mode: "openai-api-key" };
 }
 
 function buildHeaders(
 	initHeaders: Record<string, string> | undefined,
 	additionalHeaders: Record<string, string> | undefined,
-	accountId: string,
+	auth: ResolvedCodexAuth,
 	token: string,
 	sessionId?: string,
 ): Headers {
 	const headers = new Headers(initHeaders);
 	headers.set("Authorization", `Bearer ${token}`);
-	headers.set("chatgpt-account-id", accountId);
-	headers.set("OpenAI-Beta", "responses=experimental");
-	headers.set("originator", "pi");
+
+	if (auth.mode === "chatgpt-plan-oauth") {
+		headers.set("chatgpt-account-id", auth.accountId);
+		headers.set("OpenAI-Beta", "responses=experimental");
+		headers.set("originator", "pi");
+	}
+
 	const userAgent = _os ? `pi (${_os.platform()} ${_os.release()}; ${_os.arch()})` : "pi (browser)";
 	headers.set("User-Agent", userAgent);
 	headers.set("accept", "text/event-stream");
@@ -855,7 +903,8 @@ function buildHeaders(
 		headers.set(key, value);
 	}
 
-	if (sessionId) {
+	if (sessionId && auth.mode === "chatgpt-plan-oauth") {
+		headers.set("conversation_id", sessionId);
 		headers.set("session_id", sessionId);
 	}
 

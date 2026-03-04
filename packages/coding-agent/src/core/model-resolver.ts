@@ -14,9 +14,9 @@ import type { ModelRegistry } from "./model-registry.js";
 export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	"amazon-bedrock": "us.anthropic.claude-opus-4-6-v1",
 	anthropic: "claude-opus-4-6",
+	"openai-codex": "gpt-5.3-codex",
 	openai: "gpt-5.1-codex",
 	"azure-openai-responses": "gpt-5.2",
-	"openai-codex": "gpt-5.3-codex",
 	google: "gemini-2.5-pro",
 	"google-gemini-cli": "gemini-2.5-pro",
 	"google-antigravity": "gemini-3-pro-high",

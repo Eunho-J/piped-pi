@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { clearConfigValueCache } from "../src/core/resolve-config-value.js";
 
+const originalOpenAiApiKey = process.env.OPENAI_API_KEY;
+
 describe("AuthStorage", () => {
 	let tempDir: string;
 	let authJsonPath: string;
@@ -21,6 +23,11 @@ describe("AuthStorage", () => {
 	afterEach(() => {
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true });
+		}
+		if (originalOpenAiApiKey === undefined) {
+			delete process.env.OPENAI_API_KEY;
+		} else {
+			process.env.OPENAI_API_KEY = originalOpenAiApiKey;
 		}
 		clearConfigValueCache();
 		vi.restoreAllMocks();
@@ -449,6 +456,38 @@ describe("AuthStorage", () => {
 			const apiKey = await authStorage.getApiKey("anthropic");
 
 			expect(apiKey).toBe("stored-key");
+		});
+	});
+
+	describe("provider fallbacks", () => {
+		test("openai-codex falls back to openai API key when codex credentials are missing", async () => {
+			writeAuthJson({
+				openai: { type: "api_key", key: "sk-openai-fallback" },
+			});
+
+			authStorage = AuthStorage.create(authJsonPath);
+			const apiKey = await authStorage.getApiKey("openai-codex");
+
+			expect(apiKey).toBe("sk-openai-fallback");
+		});
+
+		test("openai-codex prefers its own OAuth token over openai fallback key", async () => {
+			process.env.OPENAI_API_KEY = "sk-openai-env";
+
+			writeAuthJson({
+				"openai-codex": {
+					type: "oauth",
+					access: "chatgpt-oauth-token",
+					refresh: "refresh-token",
+					expires: Date.now() + 60_000,
+				},
+				openai: { type: "api_key", key: "sk-openai-fallback" },
+			});
+
+			authStorage = AuthStorage.create(authJsonPath);
+			const apiKey = await authStorage.getApiKey("openai-codex");
+
+			expect(apiKey).toBe("chatgpt-oauth-token");
 		});
 	});
 });

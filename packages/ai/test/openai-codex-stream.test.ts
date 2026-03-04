@@ -7,6 +7,7 @@ import type { Context, Model } from "../src/types.js";
 
 const originalFetch = global.fetch;
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+const originalOpenAiApiKey = process.env.OPENAI_API_KEY;
 
 afterEach(() => {
 	global.fetch = originalFetch;
@@ -14,6 +15,11 @@ afterEach(() => {
 		delete process.env.PI_CODING_AGENT_DIR;
 	} else {
 		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+	}
+	if (originalOpenAiApiKey === undefined) {
+		delete process.env.OPENAI_API_KEY;
+	} else {
+		process.env.OPENAI_API_KEY = originalOpenAiApiKey;
 	}
 	vi.restoreAllMocks();
 });
@@ -127,6 +133,94 @@ describe("openai-codex streaming", () => {
 		}
 
 		expect(sawTextDelta).toBe(true);
+		expect(sawDone).toBe(true);
+	});
+
+	it("falls back to OpenAI API endpoint when using OPENAI_API_KEY", async () => {
+		process.env.OPENAI_API_KEY = "sk-openai-test";
+
+		const sse = `${[
+			`data: ${JSON.stringify({
+				type: "response.output_item.added",
+				item: { type: "message", id: "msg_1", role: "assistant", status: "in_progress", content: [] },
+			})}`,
+			`data: ${JSON.stringify({ type: "response.content_part.added", part: { type: "output_text", text: "" } })}`,
+			`data: ${JSON.stringify({ type: "response.output_text.delta", delta: "Hello" })}`,
+			`data: ${JSON.stringify({
+				type: "response.output_item.done",
+				item: {
+					type: "message",
+					id: "msg_1",
+					role: "assistant",
+					status: "completed",
+					content: [{ type: "output_text", text: "Hello" }],
+				},
+			})}`,
+			`data: ${JSON.stringify({
+				type: "response.completed",
+				response: {
+					status: "completed",
+					usage: {
+						input_tokens: 5,
+						output_tokens: 3,
+						total_tokens: 8,
+						input_tokens_details: { cached_tokens: 0 },
+					},
+				},
+			})}`,
+		].join("\n\n")}\n\n`;
+
+		const encoder = new TextEncoder();
+		const responseStream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(encoder.encode(sse));
+				controller.close();
+			},
+		});
+
+		const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+			const url = typeof input === "string" ? input : input.toString();
+			if (url === "https://api.openai.com/v1/responses") {
+				const headers = init?.headers instanceof Headers ? init.headers : undefined;
+				expect(headers?.get("Authorization")).toBe("Bearer sk-openai-test");
+				expect(headers?.has("chatgpt-account-id")).toBe(false);
+				expect(headers?.has("originator")).toBe(false);
+				return new Response(responseStream, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				});
+			}
+			return new Response("not found", { status: 404 });
+		});
+
+		global.fetch = fetchMock as typeof fetch;
+
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.2-codex",
+			name: "GPT-5.2 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+
+		const context: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		};
+
+		const streamResult = streamOpenAICodexResponses(model, context, { transport: "auto" });
+		let sawDone = false;
+		for await (const event of streamResult) {
+			if (event.type === "done") {
+				sawDone = true;
+				expect(event.message.content.find((c) => c.type === "text")?.text).toBe("Hello");
+			}
+		}
 		expect(sawDone).toBe(true);
 	});
 

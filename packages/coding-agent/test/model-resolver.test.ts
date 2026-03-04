@@ -360,6 +360,46 @@ describe("default model selection", () => {
 		expect(defaultModelPerProvider["vercel-ai-gateway"]).toBe("anthropic/claude-opus-4-6");
 	});
 
+	test("openai-codex default is preferred over openai when both are available", async () => {
+		const openaiCodexModel: Model<"openai-responses"> = {
+			id: "gpt-5.3-codex",
+			name: "GPT-5.3 Codex",
+			api: "openai-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272000,
+			maxTokens: 128000,
+		};
+		const openaiModel: Model<"openai-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-responses",
+			provider: "openai",
+			baseUrl: "https://api.openai.com/v1",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272000,
+			maxTokens: 128000,
+		};
+
+		const registry = {
+			getAvailable: async () => [openaiModel, openaiCodexModel],
+		} as unknown as Parameters<typeof findInitialModel>[0]["modelRegistry"];
+
+		const result = await findInitialModel({
+			scopedModels: [],
+			isContinuing: false,
+			modelRegistry: registry,
+		});
+
+		expect(result.model?.provider).toBe("openai-codex");
+		expect(result.model?.id).toBe("gpt-5.3-codex");
+	});
+
 	test("findInitialModel selects ai-gateway default when available", async () => {
 		const aiGatewayModel: Model<"anthropic-messages"> = {
 			id: "anthropic/claude-opus-4-6",

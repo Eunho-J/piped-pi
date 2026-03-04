@@ -16,7 +16,7 @@ Pi supports subscription-based providers via OAuth and API key providers via env
 Use `/login` in interactive mode, then select a provider:
 
 - Claude Pro/Max
-- ChatGPT Plus/Pro (Codex)
+- ChatGPT Plan (Codex)
 - GitHub Copilot
 - Google Gemini CLI
 - Google Antigravity
@@ -37,8 +37,9 @@ Use `/logout` to clear credentials. Tokens are stored in `~/.pi/agent/auth.json`
 
 ### OpenAI Codex
 
-- Requires ChatGPT Plus or Pro subscription
+- Requires a ChatGPT plan with Codex access
 - Personal use only; for production, use the OpenAI Platform API
+- If both are configured, pi prefers ChatGPT OAuth for `openai-codex` and falls back to OpenAI API credentials when OAuth is unavailable.
 
 ## API Keys
 
@@ -184,3 +185,5 @@ When resolving credentials for a provider:
 2. `auth.json` entry (API key or OAuth token)
 3. Environment variable
 4. Custom provider keys from `models.json`
+
+`openai-codex` uses the same order, then falls back to `openai` credentials (for example `OPENAI_API_KEY`).

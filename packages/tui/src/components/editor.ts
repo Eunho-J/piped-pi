@@ -96,6 +96,7 @@ const KITTY_CSI_U_REGEX = /^\x1b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+
 const KITTY_MOD_SHIFT = 1;
 const KITTY_MOD_ALT = 2;
 const KITTY_MOD_CTRL = 4;
+const SLASH_COMMAND_NAME_REGEX = /^[a-zA-Z0-9._-]*$/;
 
 // Decode a printable CSI-u sequence, preferring the shifted key when present.
 function decodeKittyPrintable(data: string): string | undefined {
@@ -939,6 +940,11 @@ export class Editor implements Component, Focusable {
 
 		if (this.onChange) {
 			this.onChange(this.getText());
+		}
+
+		if (this.shouldDisableSlashAutocompleteForComposition()) {
+			this.cancelAutocomplete();
+			return;
 		}
 
 		// Check if we should trigger or update autocomplete
@@ -1864,6 +1870,33 @@ export class Editor implements Component, Focusable {
 
 	private isInSlashCommandContext(textBeforeCursor: string): boolean {
 		return this.isSlashMenuAllowed() && textBeforeCursor.trimStart().startsWith("/");
+	}
+
+	private getSlashCommandNameBeforeCursor(): string | null {
+		if (!this.isSlashMenuAllowed()) {
+			return null;
+		}
+
+		const currentLine = this.state.lines[this.state.cursorLine] || "";
+		const textBeforeCursor = currentLine.slice(0, this.state.cursorCol);
+		if (!textBeforeCursor.startsWith("/")) {
+			return null;
+		}
+
+		const spaceIndex = textBeforeCursor.indexOf(" ");
+		if (spaceIndex !== -1) {
+			return null;
+		}
+
+		return textBeforeCursor.slice(1);
+	}
+
+	private shouldDisableSlashAutocompleteForComposition(): boolean {
+		const slashCommandName = this.getSlashCommandNameBeforeCursor();
+		if (slashCommandName === null) {
+			return false;
+		}
+		return !SLASH_COMMAND_NAME_REGEX.test(slashCommandName);
 	}
 
 	// Autocomplete methods

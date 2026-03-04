@@ -5,6 +5,7 @@ import { basename, dirname, join } from "path";
 import { fuzzyFilter } from "./fuzzy.js";
 
 const PATH_DELIMITERS = new Set([" ", "\t", '"', "'", "="]);
+const SLASH_COMMAND_NAME_REGEX = /^[a-zA-Z0-9._-]*$/;
 
 function findLastDelimiter(text: string): number {
 	for (let i = text.length - 1; i >= 0; i -= 1) {
@@ -230,6 +231,9 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			if (spaceIndex === -1) {
 				// No space yet - complete command names with fuzzy matching
 				const prefix = textBeforeCursor.slice(1); // Remove the "/"
+				if (!SLASH_COMMAND_NAME_REGEX.test(prefix)) {
+					return null;
+				}
 				const commandItems = this.commands.map((cmd) => ({
 					name: "name" in cmd ? cmd.name : cmd.value,
 					label: "name" in cmd ? cmd.name : cmd.label,

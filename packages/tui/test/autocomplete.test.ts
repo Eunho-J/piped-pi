@@ -104,6 +104,17 @@ describe("CombinedAutocompleteProvider", () => {
 				assert.strictEqual(result.prefix, "/", "Prefix should be '/'");
 			}
 		});
+
+		it("returns no slash suggestions for IME composition text", () => {
+			const provider = new CombinedAutocompleteProvider([{ name: "help" }, { name: "model" }], "/tmp");
+			const lines = ["/한"];
+			const cursorLine = 0;
+			const cursorCol = lines[0]!.length;
+
+			const result = provider.getSuggestions(lines, cursorLine, cursorCol);
+
+			assert.strictEqual(result, null, "Slash command autocomplete should ignore non-ASCII IME composition text");
+		});
 	});
 
 	describe("fd @ file suggestions", { skip: !isFdInstalled }, () => {

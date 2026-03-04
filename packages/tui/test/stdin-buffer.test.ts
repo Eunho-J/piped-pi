@@ -291,6 +291,22 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedSequences, ["\x1b[A"]);
 		});
 
+		it("should decode split UTF-8 buffer chunks for Hangul input", () => {
+			for (const byte of Buffer.from("한")) {
+				processInput(Buffer.from([byte]));
+			}
+
+			assert.deepStrictEqual(emittedSequences, ["한"]);
+		});
+
+		it("should decode mixed ASCII and Hangul from split UTF-8 buffer chunks", () => {
+			for (const byte of Buffer.from("ab한글z")) {
+				processInput(Buffer.from([byte]));
+			}
+
+			assert.deepStrictEqual(emittedSequences, ["a", "b", "한", "글", "z"]);
+		});
+
 		it("should handle very long sequences", () => {
 			const longSeq = `\x1b[${"1;".repeat(50)}H`;
 			processInput(longSeq);

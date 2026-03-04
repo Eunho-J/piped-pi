@@ -9,6 +9,7 @@ import { CategoryRouter } from "./routing/CategoryRouter.js";
 import { createBackgroundCancelTool, createBackgroundOutputTool } from "./tools/background-task-tool.js";
 import { createSharedStateTool } from "./tools/shared-state-tool.js";
 import { createTaskTool } from "./tools/task-tool.js";
+import { multiAgentUsage, runMultiAgentDoctor, runMultiAgentInitFlow, runMultiAgentPresetFlow } from "./ux.js";
 
 interface MultiAgentRuntime {
 	signature: string;
@@ -113,6 +114,55 @@ export default function multiAgentExtension(pi: ExtensionAPI): void {
 	pi.registerTool(createBackgroundCancelTool((ctx) => buildRuntime(ctx).delegator));
 	pi.registerTool(createSharedStateTool());
 
+	pi.registerCommand("multi-agent", {
+		description: "Guided multi-agent onboarding, presets, and diagnostics",
+		handler: async (args, ctx) => {
+			const [subcommand, ...rest] = splitArgs(args);
+			const tailArgs = rest.join(" ");
+
+			if (!subcommand || subcommand === "help") {
+				console.log(multiAgentUsage());
+				return;
+			}
+
+			if (subcommand === "init") {
+				const result = await runMultiAgentInitFlow(tailArgs, ctx);
+				runtime = undefined;
+				const status = result.applied
+					? `Applied ${result.appliedChanges} change(s) to ${result.path}${result.backupPath ? ` (backup: ${result.backupPath})` : ""}`
+					: `No changes applied. (${result.path})`;
+				console.log(status);
+				return;
+			}
+
+			if (subcommand === "preset") {
+				const result = await runMultiAgentPresetFlow(tailArgs, ctx);
+				runtime = undefined;
+				console.log(
+					`Preset ${result.preset} applied with ${result.appliedChanges} change(s) in ${result.path}${
+						result.backupPath ? ` (backup: ${result.backupPath})` : ""
+					}`,
+				);
+				return;
+			}
+
+			if (subcommand === "doctor") {
+				const report = runMultiAgentDoctor(ctx);
+				console.log(report.text);
+				if (ctx.hasUI) {
+					const level = report.errorCount > 0 ? "error" : report.warnCount > 0 ? "warning" : "info";
+					ctx.ui.notify(
+						`multi-agent doctor: ${report.errorCount} errors, ${report.warnCount} warnings, ${report.okCount} ok`,
+						level,
+					);
+				}
+				return;
+			}
+
+			throw new Error(`Unknown subcommand "${subcommand}".\n${multiAgentUsage()}`);
+		},
+	});
+
 	pi.registerCommand("agents", {
 		description: "List registered multi-agent workers and defaults",
 		handler: async (_args, ctx) => {
@@ -192,6 +242,8 @@ export type {
 	ModelCapability,
 	ModelChainEntry,
 	MultiAgentConfig,
+	MultiAgentInitState,
+	MultiAgentPreset,
 	ProviderKeyOverrides,
 	ResolvedModel,
 } from "./routing/types.js";

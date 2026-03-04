@@ -61,12 +61,29 @@ export interface ProviderKeyOverrides {
 	};
 }
 
+export type MultiAgentPreset = "balanced" | "quality" | "budget";
+
+export interface MultiAgentInitStateRecommendation {
+	model: string;
+	thinkingLevel?: ThinkingLevel;
+}
+
+export interface MultiAgentInitState {
+	version: 1;
+	preset: MultiAgentPreset;
+	connectedProviders: string[];
+	recommendedAt: string;
+	agents: Record<string, MultiAgentInitStateRecommendation>;
+	categories: Record<string, MultiAgentInitStateRecommendation>;
+}
+
 export interface MultiAgentConfig {
 	enabled?: boolean;
 	agents?: Record<string, AgentModelConfig>;
 	categories?: Record<string, AgentModelConfig>;
 	providerKeys?: ProviderKeyOverrides;
 	lastResortModel?: string;
+	initState?: MultiAgentInitState;
 }
 
 export type ResolveMethod =

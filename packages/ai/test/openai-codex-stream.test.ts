@@ -24,6 +24,68 @@ afterEach(() => {
 	vi.restoreAllMocks();
 });
 
+function createHelloSseStream(text = "Hello"): ReadableStream<Uint8Array> {
+	const sse = `${[
+		`data: ${JSON.stringify({
+			type: "response.output_item.added",
+			item: { type: "message", id: "msg_1", role: "assistant", status: "in_progress", content: [] },
+		})}`,
+		`data: ${JSON.stringify({ type: "response.content_part.added", part: { type: "output_text", text: "" } })}`,
+		`data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}`,
+		`data: ${JSON.stringify({
+			type: "response.output_item.done",
+			item: {
+				type: "message",
+				id: "msg_1",
+				role: "assistant",
+				status: "completed",
+				content: [{ type: "output_text", text }],
+			},
+		})}`,
+		`data: ${JSON.stringify({
+			type: "response.completed",
+			response: {
+				status: "completed",
+				usage: {
+					input_tokens: 5,
+					output_tokens: 3,
+					total_tokens: 8,
+					input_tokens_details: { cached_tokens: 0 },
+				},
+			},
+		})}`,
+	].join("\n\n")}\n\n`;
+
+	const encoder = new TextEncoder();
+	return new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(encoder.encode(sse));
+			controller.close();
+		},
+	});
+}
+
+function parseRequestBody(init?: RequestInit): Record<string, unknown> | null {
+	if (typeof init?.body !== "string") return null;
+	return JSON.parse(init.body) as Record<string, unknown>;
+}
+
+function buildUnsupportedPromptCacheRetentionResponse(): Response {
+	return new Response(
+		JSON.stringify({
+			error: {
+				type: "invalid_request_error",
+				param: "prompt_cache_retention",
+				message: "Unsupported parameter: prompt_cache_retention",
+			},
+		}),
+		{
+			status: 400,
+			headers: { "content-type": "application/json" },
+		},
+	);
+}
+
 describe("openai-codex streaming", () => {
 	it("streams SSE responses into AssistantMessageEventStream", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pi-codex-stream-"));
@@ -224,9 +286,53 @@ describe("openai-codex streaming", () => {
 		expect(sawDone).toBe(true);
 	});
 
-	it("sets conversation_id/session_id headers and prompt_cache_key when sessionId is provided", async () => {
+	it("sends prompt_cache_retention on supported OpenAI API endpoint when sessionId is provided", async () => {
+		process.env.OPENAI_API_KEY = "sk-openai-test";
+
+		const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+			const url = typeof input === "string" ? input : input.toString();
+			if (url === "https://api.openai.com/v1/responses") {
+				const body = parseRequestBody(init);
+				expect(body?.prompt_cache_key).toBe("session-supported-endpoint");
+				expect(body?.prompt_cache_retention).toBe("in-memory");
+				return new Response(createHelloSseStream(), {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				});
+			}
+			return new Response("not found", { status: 404 });
+		});
+
+		global.fetch = fetchMock as typeof fetch;
+
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+
+		const context: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		};
+
+		await streamOpenAICodexResponses(model, context, {
+			sessionId: "session-supported-endpoint",
+			transport: "auto",
+		}).result();
+	});
+
+	it("sets conversation_id/session_id headers and prompt_cache_key but omits prompt_cache_retention for oauth mode", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pi-codex-stream-"));
 		process.env.PI_CODING_AGENT_DIR = tempDir;
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
 		const payload = Buffer.from(
 			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acc_test" } }),
@@ -289,9 +395,9 @@ describe("openai-codex streaming", () => {
 				expect(headers?.get("session_id")).toBe(sessionId);
 
 				// Verify sessionId is set in request body as prompt_cache_key
-				const body = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : null;
+				const body = parseRequestBody(init);
 				expect(body?.prompt_cache_key).toBe(sessionId);
-				expect(body?.prompt_cache_retention).toBe("in-memory");
+				expect(body?.prompt_cache_retention).toBeUndefined();
 
 				return new Response(stream, {
 					status: 200,
@@ -323,6 +429,130 @@ describe("openai-codex streaming", () => {
 
 		const streamResult = streamOpenAICodexResponses(model, context, { apiKey: token, sessionId });
 		await streamResult.result();
+		expect(warnSpy).toHaveBeenCalledWith(
+			"[openai-codex-responses] prompt_cache_retention compatibility",
+			expect.objectContaining({
+				reason: "unsupported_endpoint_capability_unknown",
+				authMode: "chatgpt-plan-oauth",
+				endpointHost: "chatgpt.com",
+			}),
+		);
+	});
+
+	it("retries once without prompt_cache_retention on explicit unsupported-parameter errors", async () => {
+		process.env.OPENAI_API_KEY = "sk-openai-test";
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+		let attempts = 0;
+		const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+			const url = typeof input === "string" ? input : input.toString();
+			if (url !== "https://api.openai.com/v1/responses") {
+				return new Response("not found", { status: 404 });
+			}
+
+			attempts += 1;
+			const body = parseRequestBody(init);
+			if (attempts === 1) {
+				expect(body?.prompt_cache_retention).toBe("in-memory");
+				return buildUnsupportedPromptCacheRetentionResponse();
+			}
+
+			expect(body?.prompt_cache_retention).toBeUndefined();
+			expect(body?.prompt_cache_key).toBe("session-retry-once");
+			return new Response(createHelloSseStream(), {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			});
+		});
+
+		global.fetch = fetchMock as typeof fetch;
+
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+
+		const context: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		};
+
+		const message = await streamOpenAICodexResponses(model, context, {
+			sessionId: "session-retry-once",
+			transport: "auto",
+		}).result();
+
+		expect(message.stopReason).toBe("stop");
+		expect(attempts).toBe(2);
+		expect(warnSpy).toHaveBeenCalledWith(
+			"[openai-codex-responses] prompt_cache_retention compatibility",
+			expect.objectContaining({
+				reason: "unsupported_parameter_retry_without_prompt_cache_retention",
+				authMode: "openai-api-key",
+				status: 400,
+				endpointHost: "api.openai.com",
+			}),
+		);
+	});
+
+	it("does not retry in a loop when unsupported-parameter errors repeat", async () => {
+		process.env.OPENAI_API_KEY = "sk-openai-test";
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+		let attempts = 0;
+		const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+			const url = typeof input === "string" ? input : input.toString();
+			if (url !== "https://api.openai.com/v1/responses") {
+				return new Response("not found", { status: 404 });
+			}
+
+			attempts += 1;
+			const body = parseRequestBody(init);
+			if (attempts === 1) {
+				expect(body?.prompt_cache_retention).toBe("in-memory");
+			} else {
+				expect(body?.prompt_cache_retention).toBeUndefined();
+			}
+			return buildUnsupportedPromptCacheRetentionResponse();
+		});
+
+		global.fetch = fetchMock as typeof fetch;
+
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+
+		const context: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		};
+
+		const message = await streamOpenAICodexResponses(model, context, {
+			sessionId: "session-no-loop",
+			transport: "auto",
+		}).result();
+
+		expect(message.stopReason).toBe("error");
+		expect(message.errorMessage).toContain("Unsupported parameter: prompt_cache_retention");
+		expect(attempts).toBe(2);
+		expect(warnSpy).toHaveBeenCalledTimes(1);
 	});
 
 	it("clamps gpt-5.3-codex minimal reasoning effort to low", async () => {

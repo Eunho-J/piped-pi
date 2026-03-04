@@ -29,6 +29,7 @@ import { buildBaseOptions, clampReasoning } from "./simple-options.js";
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const JWT_CLAIM_PATH = "https://api.openai.com/auth" as const;
+const OPENAI_API_HOST = "api.openai.com";
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
 const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
@@ -53,6 +54,9 @@ export interface OpenAICodexResponsesOptions extends StreamOptions {
 }
 
 type CodexResponseStatus = "completed" | "incomplete" | "failed" | "cancelled" | "queued" | "in_progress";
+type PromptCacheRetentionWarningReason =
+	| "unsupported_endpoint_capability_unknown"
+	| "unsupported_parameter_retry_without_prompt_cache_retention";
 
 interface RequestBody {
 	model: string;
@@ -72,6 +76,10 @@ interface RequestBody {
 	[key: string]: unknown;
 }
 
+interface BuildRequestBodyOptions {
+	includePromptCacheRetention: boolean;
+}
+
 type CodexAuthMode = "chatgpt-plan-oauth" | "openai-api-key";
 
 type ResolvedCodexAuth =
@@ -82,6 +90,8 @@ type ResolvedCodexAuth =
 	| {
 			mode: "openai-api-key";
 	  };
+
+class NonRetryableRequestError extends Error {}
 
 // ============================================================================
 // Retry Helpers
@@ -105,6 +115,71 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 			clearTimeout(timeout);
 			reject(new Error("Request was aborted"));
 		});
+	});
+}
+
+function getEndpointHost(url: string): string | undefined {
+	try {
+		return new URL(url).host;
+	} catch {
+		return undefined;
+	}
+}
+
+function supportsPromptCacheRetention(mode: CodexAuthMode, requestUrl: string): boolean {
+	if (mode !== "openai-api-key") return false;
+	try {
+		return new URL(requestUrl).hostname === OPENAI_API_HOST;
+	} catch {
+		return false;
+	}
+}
+
+function isUnsupportedPromptCacheRetentionError(status: number, errorText: string): boolean {
+	if (status !== 400 && status !== 422) return false;
+
+	let parsed: Record<string, unknown> | undefined;
+	try {
+		parsed = JSON.parse(errorText) as Record<string, unknown>;
+	} catch {
+		// ignore parse failures
+	}
+
+	const rootParam = parsed?.param;
+	const rootMessage = parsed?.message;
+	const errorObject =
+		parsed?.error && typeof parsed.error === "object" && parsed.error !== null
+			? (parsed.error as Record<string, unknown>)
+			: undefined;
+	const errorParam = errorObject?.param;
+	const errorMessage = errorObject?.message;
+	const hasPromptCacheParam =
+		rootParam === "prompt_cache_retention" ||
+		errorParam === "prompt_cache_retention" ||
+		/prompt_cache_retention/i.test(errorText);
+
+	if (!hasPromptCacheParam) return false;
+
+	const messages = [errorText, rootMessage, errorMessage]
+		.filter((value): value is string => typeof value === "string")
+		.map((value) => value.toLowerCase());
+
+	return messages.some((message) =>
+		/(unsupported parameter|unknown parameter|unexpected parameter|not (supported|allowed|permitted))/i.test(message),
+	);
+}
+
+function logPromptCacheRetentionWarning(
+	requestUrl: string,
+	authMode: CodexAuthMode,
+	reason: PromptCacheRetentionWarningReason,
+	status?: number,
+): void {
+	console.warn("[openai-codex-responses] prompt_cache_retention compatibility", {
+		reason,
+		authMode,
+		endpointHost: getEndpointHost(requestUrl),
+		...(status !== undefined ? { status } : {}),
 	});
 }
 
@@ -145,11 +220,15 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			}
 
 			const auth = resolveCodexAuth(apiKey);
-			const body = buildRequestBody(model, context, options);
+			const requestUrl = resolveCodexUrl(model.baseUrl, auth.mode);
+			const includePromptCacheRetention = supportsPromptCacheRetention(auth.mode, requestUrl);
+			const body = buildRequestBody(model, context, options, { includePromptCacheRetention });
+			if (options?.sessionId && !includePromptCacheRetention) {
+				logPromptCacheRetentionWarning(requestUrl, auth.mode, "unsupported_endpoint_capability_unknown");
+			}
 			options?.onPayload?.(body);
 			const headers = buildHeaders(model.headers, options?.headers, auth, apiKey, options?.sessionId);
-			const bodyJson = JSON.stringify(body);
-			const requestUrl = resolveCodexUrl(model.baseUrl, auth.mode);
+			let bodyJson = JSON.stringify(body);
 			const requestedTransport = options?.transport || "sse";
 
 			if (auth.mode === "openai-api-key" && requestedTransport === "websocket") {
@@ -196,6 +275,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			// Fetch with retry logic for rate limits and transient errors
 			let response: Response | undefined;
 			let lastError: Error | undefined;
+			let didRetryWithoutPromptCacheRetention = false;
 
 			for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
 				if (options?.signal?.aborted) {
@@ -215,6 +295,22 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 					}
 
 					const errorText = await response.text();
+					if (
+						!didRetryWithoutPromptCacheRetention &&
+						body.prompt_cache_retention &&
+						isUnsupportedPromptCacheRetentionError(response.status, errorText)
+					) {
+						didRetryWithoutPromptCacheRetention = true;
+						delete body.prompt_cache_retention;
+						bodyJson = JSON.stringify(body);
+						logPromptCacheRetentionWarning(
+							requestUrl,
+							auth.mode,
+							"unsupported_parameter_retry_without_prompt_cache_retention",
+							response.status,
+						);
+						continue;
+					}
 					if (attempt < MAX_RETRIES && isRetryableError(response.status, errorText)) {
 						const delayMs = BASE_DELAY_MS * 2 ** attempt;
 						await sleep(delayMs, options?.signal);
@@ -227,7 +323,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 						statusText: response.statusText,
 					});
 					const info = await parseErrorResponse(fakeResponse, auth.mode);
-					throw new Error(info.friendlyMessage || info.message);
+					throw new NonRetryableRequestError(info.friendlyMessage || info.message);
 				} catch (error) {
 					if (error instanceof Error) {
 						if (error.name === "AbortError" || error.message === "Request was aborted") {
@@ -235,6 +331,9 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 						}
 					}
 					lastError = error instanceof Error ? error : new Error(String(error));
+					if (lastError instanceof NonRetryableRequestError) {
+						throw lastError;
+					}
 					// Network errors are retryable
 					if (attempt < MAX_RETRIES && !lastError.message.includes("usage limit")) {
 						const delayMs = BASE_DELAY_MS * 2 ** attempt;
@@ -300,6 +399,7 @@ function buildRequestBody(
 	model: Model<"openai-codex-responses">,
 	context: Context,
 	options?: OpenAICodexResponsesOptions,
+	buildOptions?: BuildRequestBodyOptions,
 ): RequestBody {
 	const messages = convertResponsesMessages(model, context, CODEX_TOOL_CALL_PROVIDERS, {
 		includeSystemPrompt: false,
@@ -314,7 +414,7 @@ function buildRequestBody(
 		text: { verbosity: options?.textVerbosity || "medium" },
 		include: ["reasoning.encrypted_content"],
 		prompt_cache_key: options?.sessionId,
-		prompt_cache_retention: options?.sessionId ? "in-memory" : undefined,
+		prompt_cache_retention: buildOptions?.includePromptCacheRetention && options?.sessionId ? "in-memory" : undefined,
 		tool_choice: "auto",
 		parallel_tool_calls: true,
 	};

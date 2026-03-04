@@ -17,6 +17,7 @@
  * MIT License - Copyright (c) 2025 opentui
  */
 
+import { StringDecoder } from "node:string_decoder";
 import { EventEmitter } from "events";
 
 const ESC = "\x1b";
@@ -246,6 +247,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private readonly timeoutMs: number;
 	private pasteMode: boolean = false;
 	private pasteBuffer: string = "";
+	private utf8Decoder = new StringDecoder("utf8");
 
 	constructor(options: StdinBufferOptions = {}) {
 		super();
@@ -259,15 +261,18 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.timeout = null;
 		}
 
-		// Handle high-byte conversion (for compatibility with parseKeypress)
-		// If buffer has single byte > 127, convert to ESC + (byte - 128)
+		// Decode Buffer chunks with a streaming UTF-8 decoder so multi-byte input
+		// (e.g., IME composition text) survives split chunk boundaries.
 		let str: string;
 		if (Buffer.isBuffer(data)) {
-			if (data.length === 1 && data[0]! > 127) {
-				const byte = data[0]! - 128;
-				str = `\x1b${String.fromCharCode(byte)}`;
+			if (data.length === 0) {
+				str = "";
 			} else {
-				str = data.toString();
+				str = this.utf8Decoder.write(data);
+				if (str.length === 0) {
+					this.scheduleFlushTimeoutIfNeeded();
+					return;
+				}
 			}
 		} else {
 			str = data;
@@ -340,15 +345,21 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.emit("data", sequence);
 		}
 
-		if (this.buffer.length > 0) {
-			this.timeout = setTimeout(() => {
-				const flushed = this.flush();
+		this.scheduleFlushTimeoutIfNeeded();
+	}
 
-				for (const sequence of flushed) {
-					this.emit("data", sequence);
-				}
-			}, this.timeoutMs);
+	private scheduleFlushTimeoutIfNeeded(): void {
+		if (this.buffer.length === 0) {
+			return;
 		}
+
+		this.timeout = setTimeout(() => {
+			const flushed = this.flush();
+
+			for (const sequence of flushed) {
+				this.emit("data", sequence);
+			}
+		}, this.timeoutMs);
 	}
 
 	flush(): string[] {
@@ -374,6 +385,8 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.buffer = "";
 		this.pasteMode = false;
 		this.pasteBuffer = "";
+		this.utf8Decoder.end();
+		this.utf8Decoder = new StringDecoder("utf8");
 	}
 
 	getBuffer(): string {

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { createIpcMessage, type TaskDelegateMessage } from "@mariozechner/pi-ipc";
 import type { AgentRegistry } from "../registry/AgentRegistry.js";
 import type { CategoryRouter } from "../routing/CategoryRouter.js";
 import { ModelRouter } from "../routing/ModelRouter.js";
@@ -26,6 +27,10 @@ interface ExecutionStrategy {
 	agentName: string;
 	category?: string;
 	resolved: ResolvedModel;
+	remote?: {
+		sessionId: string;
+		socketPath: string;
+	};
 }
 
 interface BackgroundTaskHandle {
@@ -97,7 +102,7 @@ export class TaskDelegator {
 	}
 
 	async execute(params: TaskDelegateParams, ctx: ExtensionContext): Promise<TaskDelegateResult> {
-		const strategy = await this.resolveStrategy(params);
+		const strategy = await this.resolveStrategy(params, ctx);
 		if (params.run_in_background) {
 			return this.executeBackground(params, strategy, ctx);
 		}
@@ -127,7 +132,7 @@ export class TaskDelegator {
 		return true;
 	}
 
-	private async resolveStrategy(params: TaskDelegateParams): Promise<ExecutionStrategy> {
+	private async resolveStrategy(params: TaskDelegateParams, ctx: ExtensionContext): Promise<ExecutionStrategy> {
 		if (params.agent) {
 			const factory = this.registry.get(params.agent);
 			if (!factory) {
@@ -137,10 +142,12 @@ export class TaskDelegator {
 				throw new Error(`Agent ${params.agent} cannot be called via task(); mode=${factory.mode}`);
 			}
 			const resolved = await this.modelRouter.resolveForAgent(params.agent, params.category);
+			const remote = this.resolveRemoteTarget(params.agent, ctx);
 			return {
 				type: "agent",
 				agentName: params.agent,
 				resolved,
+				remote,
 			};
 		}
 
@@ -171,6 +178,10 @@ export class TaskDelegator {
 		strategy: ExecutionStrategy,
 		ctx: ExtensionContext,
 	): Promise<TaskDelegateResult> {
+		if (strategy.remote && ctx.createIpcClient) {
+			return this.executeRemoteSync(params, strategy, ctx);
+		}
+
 		if (!ctx.runSubAgent) {
 			throw new Error("This runtime does not support runSubAgent(). Update to a compatible pi-coding-agent build.");
 		}
@@ -206,6 +217,67 @@ export class TaskDelegator {
 				resolved_via: strategy.resolved.resolvedVia,
 			},
 		};
+	}
+
+	private async executeRemoteSync(
+		params: TaskDelegateParams,
+		strategy: ExecutionStrategy,
+		ctx: ExtensionContext,
+	): Promise<TaskDelegateResult> {
+		if (!strategy.remote || !ctx.createIpcClient) {
+			throw new Error("Remote delegation requires IPC client support.");
+		}
+
+		const sessionId = params.session_id ?? `ses_${randomUUID()}`;
+		const startedAt = new Date().toISOString();
+		const prompt = this.applySkillPrelude(params.prompt, params.load_skills);
+		const taskId = `task_${randomUUID()}`;
+		const client = ctx.createIpcClient(strategy.remote.socketPath);
+
+		try {
+			const response = await client.send(
+				createIpcMessage<TaskDelegateMessage>({
+					type: "task.delegate",
+					payload: {
+						taskId,
+						sessionId,
+						parentSessionId: ctx.sessionManager.getSessionId(),
+						prompt,
+						agentName: strategy.agentName,
+						category: strategy.category,
+						model: strategy.resolved.modelId,
+						skills: params.load_skills,
+					},
+					senderSessionId: ctx.sessionManager.getSessionId(),
+				}),
+			);
+
+			if (!response.success) {
+				throw new Error(response.error ?? "remote_task_delegate_failed");
+			}
+
+			const data = response.data as
+				| {
+						output?: string;
+						tokenUsage?: { input: number; output: number };
+				  }
+				| undefined;
+			return {
+				session_id: sessionId,
+				mode: "sync",
+				output: data?.output ?? "",
+				model_used: strategy.resolved.modelId,
+				agent_used: strategy.agentName,
+				metadata: {
+					started_at: startedAt,
+					completed_at: new Date().toISOString(),
+					token_usage: data?.tokenUsage,
+					resolved_via: `${strategy.resolved.resolvedVia}:remote`,
+				},
+			};
+		} finally {
+			await client.disconnect();
+		}
 	}
 
 	private async executeBackground(
@@ -256,5 +328,24 @@ export class TaskDelegator {
 			return prompt;
 		}
 		return [`Requested skills: ${skills.join(", ")}`, "", prompt].join("\n");
+	}
+
+	private resolveRemoteTarget(agentName: string, ctx: ExtensionContext): ExecutionStrategy["remote"] | undefined {
+		if (!ctx.agentDiscovery || !ctx.createIpcClient) {
+			return undefined;
+		}
+
+		const currentSessionId = ctx.sessionManager.getSessionId();
+		const target = ctx.agentDiscovery
+			.listAlive()
+			.find((record) => record.agentName === agentName && record.sessionId !== currentSessionId);
+		if (!target) {
+			return undefined;
+		}
+
+		return {
+			sessionId: target.sessionId,
+			socketPath: target.socketPath,
+		};
 	}
 }

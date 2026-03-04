@@ -16,6 +16,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { inspect } from "node:util";
 import type {
 	Agent,
 	AgentEvent,
@@ -27,7 +28,16 @@ import type {
 import { Agent as CoreAgent } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@mariozechner/pi-ai";
 import { isContextOverflow, modelsAreEqual, resetApiProviders, supportsXhigh } from "@mariozechner/pi-ai";
-import type { IpcMessage, IpcResponse, TaskProgressMessage } from "@mariozechner/pi-ipc";
+import type {
+	AgentDiscoveryRecord,
+	IpcMessage,
+	IpcResponse,
+	PubSubSubscribeMessage,
+	SessionFollowUpMessage,
+	SessionSteerMessage,
+	TaskProgressMessage,
+	TaskResultMessage,
+} from "@mariozechner/pi-ipc";
 import {
 	AgentDiscovery,
 	AgentIpcClient,
@@ -173,6 +183,8 @@ export interface AgentSessionConfig {
 	onIpcServerStop?: () => void;
 	/** Optional externally-provided agent registry surfaced to extensions */
 	agentRegistry?: AgentRegistryAdapter;
+	/** Optional explicit agent name advertised over IPC discovery metadata */
+	agentName?: string;
 }
 
 export interface ExtensionBindings {
@@ -192,6 +204,11 @@ export interface PromptOptions {
 	streamingBehavior?: "steer" | "followUp";
 	/** Source of input for extension input event handlers. Defaults to "interactive". */
 	source?: InputSource;
+}
+
+export interface ExecuteExtensionCommandOptions {
+	captureOutput?: boolean;
+	suppressErrors?: boolean;
 }
 
 /** Result from cycleModel() */
@@ -291,6 +308,7 @@ export class AgentSession {
 	// Model registry for API key resolution
 	private _modelRegistry: ModelRegistry;
 	private _agentRegistry?: AgentRegistryAdapter;
+	private _agentName?: string;
 
 	// IPC integration
 	private _enableIpc = false;
@@ -319,6 +337,7 @@ export class AgentSession {
 		this._cwd = config.cwd;
 		this._modelRegistry = config.modelRegistry;
 		this._agentRegistry = config.agentRegistry;
+		this._agentName = config.agentName;
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._baseToolsOverride = config.baseToolsOverride;
@@ -650,6 +669,9 @@ export class AgentSession {
 			sessionId: this.sessionId,
 			socketDir: this._ipcSocketDir,
 			onMessage: async (message) => this._routeIpcMessage(message),
+			agentName: this._agentName ?? this.sessionName ?? "agent",
+			status: "idle",
+			currentModel: this._currentModelRef(),
 		});
 		try {
 			await this._ipcServer.start();
@@ -690,6 +712,57 @@ export class AgentSession {
 					data: { queued: true, queue: "follow_up" },
 				});
 			}
+			case "task.delegate": {
+				const startedAt = Date.now();
+				const targetModel = message.payload.model ?? this._currentModelRef();
+				if (!targetModel) {
+					return createIpcResponse({
+						id: message.id,
+						success: false,
+						error: "task_delegate_requires_model",
+					});
+				}
+
+				const registeredAgent = this._resolveTaskDelegateAgentConfig(message.payload.agentName, targetModel);
+				const result = await this.runSubAgent({
+					agentName: message.payload.agentName ?? this._agentName ?? "sisyphus-junior",
+					sessionId: message.payload.sessionId,
+					taskId: message.payload.taskId,
+					systemPrompt: registeredAgent?.systemPrompt ?? this.systemPrompt,
+					model: targetModel,
+					tools: registeredAgent?.tools ?? this.getActiveToolNames(),
+					prompt: message.payload.prompt,
+					thinkingLevel: registeredAgent?.defaultThinkingLevel ?? this.thinkingLevel,
+					inheritMessages: false,
+					ipcForward: true,
+				});
+
+				this._ipcServer?.broadcast(
+					createIpcMessage<TaskResultMessage>({
+						type: "task.result",
+						payload: {
+							taskId: message.payload.taskId,
+							sessionId: result.sessionId,
+							success: true,
+							output: result.finalText,
+							tokenUsage: result.tokenUsage,
+							durationMs: Date.now() - startedAt,
+						},
+						senderSessionId: this.sessionId,
+					}),
+				);
+
+				return createIpcResponse({
+					id: message.id,
+					success: true,
+					data: {
+						taskId: message.payload.taskId,
+						sessionId: result.sessionId,
+						output: result.finalText,
+						tokenUsage: result.tokenUsage,
+					},
+				});
+			}
 			default: {
 				if (this._onIpcMessage) {
 					const response = await this._onIpcMessage(message);
@@ -715,6 +788,54 @@ export class AgentSession {
 			content: [{ type: "text", text }],
 			timestamp: Date.now(),
 		};
+	}
+
+	private _currentModelRef(): string | undefined {
+		return this.model ? `${this.model.provider}/${this.model.id}` : undefined;
+	}
+
+	private _resolveTaskDelegateAgentConfig(
+		agentName: string | undefined,
+		model: string,
+	):
+		| {
+				systemPrompt: string;
+				tools: string[];
+				defaultThinkingLevel?: ThinkingLevel;
+		  }
+		| undefined {
+		if (!agentName || !this._agentRegistry?.instantiate) {
+			return undefined;
+		}
+
+		try {
+			const candidate = this._agentRegistry.instantiate(agentName, model);
+			if (typeof candidate !== "object" || candidate === null) {
+				return undefined;
+			}
+
+			const record = candidate as Record<string, unknown>;
+			if (typeof record.systemPrompt !== "string" || !Array.isArray(record.tools)) {
+				return undefined;
+			}
+			const tools = record.tools.filter((tool): tool is string => typeof tool === "string");
+			if (tools.length === 0) {
+				return undefined;
+			}
+
+			const defaultThinkingLevel =
+				typeof record.defaultThinkingLevel === "string" &&
+				THINKING_LEVELS_WITH_XHIGH.includes(record.defaultThinkingLevel as ThinkingLevel)
+					? (record.defaultThinkingLevel as ThinkingLevel)
+					: undefined;
+			return {
+				systemPrompt: record.systemPrompt,
+				tools,
+				defaultThinkingLevel,
+			};
+		} catch {
+			return undefined;
+		}
 	}
 
 	// =========================================================================
@@ -826,6 +947,90 @@ export class AgentSession {
 	/** IPC socket path for this session (when IPC is enabled). */
 	get ipcSocketPath(): string | undefined {
 		return this._ipcServer?.socketPath;
+	}
+
+	getDiscoveredAgents(): AgentDiscoveryRecord[] {
+		return this._agentDiscovery?.listAlive() ?? [];
+	}
+
+	getMeshStatus(): {
+		enabled: boolean;
+		running: boolean;
+		sessionId: string;
+		socketPath?: string;
+		aliveAgents: number;
+	} {
+		return {
+			enabled: this._enableIpc,
+			running: this._ipcServer?.isRunning() ?? false,
+			sessionId: this.sessionId,
+			socketPath: this.ipcSocketPath,
+			aliveAgents: this.getDiscoveredAgents().length,
+		};
+	}
+
+	async sendMeshFollowUp(targetSessionId: string, message: string): Promise<IpcResponse> {
+		return this._sendMeshMessage(
+			targetSessionId,
+			createIpcMessage<SessionFollowUpMessage>({
+				type: "session.follow_up",
+				payload: {
+					targetSessionId,
+					message,
+					token: "local",
+				},
+				senderSessionId: this.sessionId,
+			}),
+		);
+	}
+
+	async sendMeshSteer(targetSessionId: string, message: string): Promise<IpcResponse> {
+		return this._sendMeshMessage(
+			targetSessionId,
+			createIpcMessage<SessionSteerMessage>({
+				type: "session.steer",
+				payload: {
+					targetSessionId,
+					message,
+					token: "local",
+				},
+				senderSessionId: this.sessionId,
+			}),
+		);
+	}
+
+	async sendMeshSubscribe(targetSessionId: string, topics: string[]): Promise<IpcResponse> {
+		const callbackSocketPath = this.ipcSocketPath ?? this._resolveMeshSocketPath(this.sessionId);
+		return this._sendMeshMessage(
+			targetSessionId,
+			createIpcMessage<PubSubSubscribeMessage>({
+				type: "pubsub.subscribe",
+				payload: {
+					topics,
+					subscriberSessionId: this.sessionId,
+					callbackSocketPath,
+				},
+				senderSessionId: this.sessionId,
+			}),
+		);
+	}
+
+	private _resolveMeshSocketPath(sessionId: string): string {
+		const socketPath = this._agentDiscovery?.getSocketPath(sessionId);
+		if (!socketPath) {
+			throw new Error(`No alive session discovered for ${sessionId}.`);
+		}
+		return socketPath;
+	}
+
+	private async _sendMeshMessage(targetSessionId: string, message: IpcMessage): Promise<IpcResponse> {
+		const socketPath = this._resolveMeshSocketPath(targetSessionId);
+		const client = new AgentIpcClient({ socketPath });
+		try {
+			return await client.send(message);
+		} finally {
+			await client.disconnect();
+		}
 	}
 
 	/** Current session display name, if set */
@@ -1065,31 +1270,87 @@ export class AgentSession {
 	 * Try to execute an extension command. Returns true if command was found and executed.
 	 */
 	private async _tryExecuteExtensionCommand(text: string): Promise<boolean> {
-		if (!this._extensionRunner) return false;
+		const parsed = this._parseSlashCommand(text);
+		if (!parsed) {
+			return false;
+		}
+		const result = await this.executeExtensionCommand(parsed.commandName, parsed.args, {
+			captureOutput: false,
+			suppressErrors: true,
+		});
+		return result.handled;
+	}
 
-		// Parse command name and args
-		const spaceIndex = text.indexOf(" ");
-		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
-		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1);
+	async executeExtensionCommand(
+		commandName: string,
+		args = "",
+		options: ExecuteExtensionCommandOptions = {},
+	): Promise<{ handled: boolean; output: string[] }> {
+		if (!this._extensionRunner) {
+			return { handled: false, output: [] };
+		}
 
 		const command = this._extensionRunner.getCommand(commandName);
-		if (!command) return false;
+		if (!command) {
+			return { handled: false, output: [] };
+		}
 
-		// Get command context from extension runner (includes session control methods)
 		const ctx = this._extensionRunner.createCommandContext();
+		const output: string[] = [];
+		const captureOutput = options.captureOutput ?? false;
+		const suppressErrors = options.suppressErrors ?? false;
+		const originalConsoleLog = console.log;
+
+		if (captureOutput) {
+			console.log = (...values: unknown[]) => {
+				output.push(this._formatConsoleLogValues(values));
+			};
+		}
 
 		try {
 			await command.handler(args, ctx);
-			return true;
-		} catch (err) {
-			// Emit error via extension runner
+			return { handled: true, output };
+		} catch (error) {
 			this._extensionRunner.emitError({
 				extensionPath: `command:${commandName}`,
 				event: "command",
-				error: err instanceof Error ? err.message : String(err),
+				error: error instanceof Error ? error.message : String(error),
 			});
-			return true;
+			if (suppressErrors) {
+				return { handled: true, output };
+			}
+			throw error;
+		} finally {
+			if (captureOutput) {
+				console.log = originalConsoleLog;
+			}
 		}
+	}
+
+	private _formatConsoleLogValues(values: unknown[]): string {
+		return values
+			.map((value) =>
+				typeof value === "string"
+					? value
+					: inspect(value, {
+							colors: false,
+							depth: 6,
+							maxArrayLength: 200,
+							maxStringLength: 20_000,
+						}),
+			)
+			.join(" ");
+	}
+
+	private _parseSlashCommand(text: string): { commandName: string; args: string } | null {
+		const trimmed = text.trim();
+		if (!trimmed.startsWith("/")) {
+			return null;
+		}
+		const spaceIndex = trimmed.indexOf(" ");
+		const commandName = spaceIndex === -1 ? trimmed.slice(1) : trimmed.slice(1, spaceIndex);
+		const args = spaceIndex === -1 ? "" : trimmed.slice(spaceIndex + 1);
+		return { commandName, args };
 	}
 
 	/**
@@ -1438,6 +1699,7 @@ export class AgentSession {
 
 		// Re-clamp thinking level for new model's capabilities
 		this.setThinkingLevel(this.thinkingLevel);
+		this._ipcServer?.updateMetadata({ currentModel: this._currentModelRef() });
 
 		await this._emitModelSelect(model, previousModel, "set");
 	}
@@ -1496,6 +1758,7 @@ export class AgentSession {
 
 		// Apply thinking level (setThinkingLevel clamps to model capabilities)
 		this.setThinkingLevel(next.thinkingLevel);
+		this._ipcServer?.updateMetadata({ currentModel: this._currentModelRef() });
 
 		await this._emitModelSelect(next.model, currentModel, "cycle");
 
@@ -1525,6 +1788,7 @@ export class AgentSession {
 
 		// Re-clamp thinking level for new model's capabilities
 		this.setThinkingLevel(this.thinkingLevel);
+		this._ipcServer?.updateMetadata({ currentModel: this._currentModelRef() });
 
 		await this._emitModelSelect(nextModel, currentModel, "cycle");
 
@@ -2623,6 +2887,7 @@ export class AgentSession {
 			);
 			if (match) {
 				this.agent.setModel(match);
+				this._ipcServer?.updateMetadata({ currentModel: this._currentModelRef() });
 				await this._emitModelSelect(match, previousModel, "restore");
 			}
 		}

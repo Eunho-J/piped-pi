@@ -16,6 +16,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { inspect } from "node:util";
 import type {
 	Agent,
 	AgentEvent,
@@ -203,6 +204,11 @@ export interface PromptOptions {
 	streamingBehavior?: "steer" | "followUp";
 	/** Source of input for extension input event handlers. Defaults to "interactive". */
 	source?: InputSource;
+}
+
+export interface ExecuteExtensionCommandOptions {
+	captureOutput?: boolean;
+	suppressErrors?: boolean;
 }
 
 /** Result from cycleModel() */
@@ -1264,31 +1270,87 @@ export class AgentSession {
 	 * Try to execute an extension command. Returns true if command was found and executed.
 	 */
 	private async _tryExecuteExtensionCommand(text: string): Promise<boolean> {
-		if (!this._extensionRunner) return false;
+		const parsed = this._parseSlashCommand(text);
+		if (!parsed) {
+			return false;
+		}
+		const result = await this.executeExtensionCommand(parsed.commandName, parsed.args, {
+			captureOutput: false,
+			suppressErrors: true,
+		});
+		return result.handled;
+	}
 
-		// Parse command name and args
-		const spaceIndex = text.indexOf(" ");
-		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
-		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1);
+	async executeExtensionCommand(
+		commandName: string,
+		args = "",
+		options: ExecuteExtensionCommandOptions = {},
+	): Promise<{ handled: boolean; output: string[] }> {
+		if (!this._extensionRunner) {
+			return { handled: false, output: [] };
+		}
 
 		const command = this._extensionRunner.getCommand(commandName);
-		if (!command) return false;
+		if (!command) {
+			return { handled: false, output: [] };
+		}
 
-		// Get command context from extension runner (includes session control methods)
 		const ctx = this._extensionRunner.createCommandContext();
+		const output: string[] = [];
+		const captureOutput = options.captureOutput ?? false;
+		const suppressErrors = options.suppressErrors ?? false;
+		const originalConsoleLog = console.log;
+
+		if (captureOutput) {
+			console.log = (...values: unknown[]) => {
+				output.push(this._formatConsoleLogValues(values));
+			};
+		}
 
 		try {
 			await command.handler(args, ctx);
-			return true;
-		} catch (err) {
-			// Emit error via extension runner
+			return { handled: true, output };
+		} catch (error) {
 			this._extensionRunner.emitError({
 				extensionPath: `command:${commandName}`,
 				event: "command",
-				error: err instanceof Error ? err.message : String(err),
+				error: error instanceof Error ? error.message : String(error),
 			});
-			return true;
+			if (suppressErrors) {
+				return { handled: true, output };
+			}
+			throw error;
+		} finally {
+			if (captureOutput) {
+				console.log = originalConsoleLog;
+			}
 		}
+	}
+
+	private _formatConsoleLogValues(values: unknown[]): string {
+		return values
+			.map((value) =>
+				typeof value === "string"
+					? value
+					: inspect(value, {
+							colors: false,
+							depth: 6,
+							maxArrayLength: 200,
+							maxStringLength: 20_000,
+						}),
+			)
+			.join(" ");
+	}
+
+	private _parseSlashCommand(text: string): { commandName: string; args: string } | null {
+		const trimmed = text.trim();
+		if (!trimmed.startsWith("/")) {
+			return null;
+		}
+		const spaceIndex = trimmed.indexOf(" ");
+		const commandName = spaceIndex === -1 ? trimmed.slice(1) : trimmed.slice(1, spaceIndex);
+		const args = spaceIndex === -1 ? "" : trimmed.slice(spaceIndex + 1);
+		return { commandName, args };
 	}
 
 	/**

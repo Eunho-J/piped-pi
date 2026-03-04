@@ -24,6 +24,7 @@ import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcResolvedAgentModel,
 	RpcResponse,
 	RpcSessionState,
 	RpcSlashCommand,
@@ -34,9 +35,72 @@ export type {
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcResolvedAgentModel,
 	RpcResponse,
 	RpcSessionState,
 } from "./rpc-types.js";
+
+const RESOLVED_AGENT_MODEL_PATTERN = /^([^\s]+)\s*->\s*([^\s]+)\s+via\s+([^\s]+)(?:\s+thinking=([^\s]+))?$/;
+const UNRESOLVED_AGENT_MODEL_PATTERN = /^([^\s]+)\s*->\s*unresolved\s+\((.+)\)$/;
+
+function parseModelRef(modelRef: string): { provider?: string; modelId: string } {
+	const separatorIndex = modelRef.indexOf("/");
+	if (separatorIndex === -1) {
+		return { modelId: modelRef };
+	}
+	return {
+		provider: modelRef.slice(0, separatorIndex),
+		modelId: modelRef.slice(separatorIndex + 1),
+	};
+}
+
+export function parseResolvedAgentModelLine(line: string): RpcResolvedAgentModel | null {
+	const trimmed = line.trim();
+	if (trimmed.length === 0) {
+		return null;
+	}
+
+	const unresolvedMatch = trimmed.match(UNRESOLVED_AGENT_MODEL_PATTERN);
+	if (unresolvedMatch) {
+		return {
+			agentName: unresolvedMatch[1],
+			error: unresolvedMatch[2],
+		};
+	}
+
+	const resolvedMatch = trimmed.match(RESOLVED_AGENT_MODEL_PATTERN);
+	if (!resolvedMatch) {
+		return null;
+	}
+
+	const parsedModel = parseModelRef(resolvedMatch[2]);
+	return {
+		agentName: resolvedMatch[1],
+		modelId: resolvedMatch[2],
+		provider: parsedModel.provider,
+		resolvedVia: resolvedMatch[3],
+		thinkingLevel: resolvedMatch[4] as RpcResolvedAgentModel["thinkingLevel"] | undefined,
+	};
+}
+
+export function parseAvailableModelLines(lines: string[]): Array<{ provider: string; modelId: string }> {
+	const models: Array<{ provider: string; modelId: string }> = [];
+	for (const line of lines) {
+		const trimmed = line.trim();
+		if (trimmed.length === 0 || trimmed.startsWith("No models available")) {
+			continue;
+		}
+		const parsed = parseModelRef(trimmed);
+		if (!parsed.provider) {
+			continue;
+		}
+		models.push({
+			provider: parsed.provider,
+			modelId: parsed.modelId,
+		});
+	}
+	return models;
+}
 
 /**
  * Run in RPC mode.
@@ -311,6 +375,17 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 			output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
 		},
 	});
+
+	const executeExtensionCommand = async (commandName: string, args = ""): Promise<string[]> => {
+		const result = await session.executeExtensionCommand(commandName, args, {
+			captureOutput: true,
+			suppressErrors: false,
+		});
+		if (!result.handled) {
+			throw new Error(`Extension command "/${commandName}" is not registered`);
+		}
+		return result.output.map((line) => line.trim()).filter((line) => line.length > 0);
+	};
 
 	// Output all agent events as JSON
 	session.subscribe((event) => {
@@ -610,6 +685,64 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 
 			case "session.mesh.status": {
 				return success(id, "session.mesh.status", session.getMeshStatus());
+			}
+
+			// =================================================================
+			// Agent model routing controls
+			// =================================================================
+
+			case "agent.list_models": {
+				const lines = await executeExtensionCommand("agent.list_models");
+				const agents = lines
+					.map((line) => parseResolvedAgentModelLine(line))
+					.filter((resolved): resolved is RpcResolvedAgentModel => resolved !== null);
+				return success(id, "agent.list_models", { agents });
+			}
+
+			case "agent.get_model": {
+				const args = command.category ? `${command.agentName} ${command.category}` : command.agentName;
+				const lines = await executeExtensionCommand("agent.get_model", args);
+				const resolved = lines.map((line) => parseResolvedAgentModelLine(line)).find((entry) => entry !== null);
+				if (!resolved) {
+					return error(id, "agent.get_model", `Unexpected /agent.get_model output: ${lines.join(" | ")}`);
+				}
+				return success(id, "agent.get_model", { resolved });
+			}
+
+			case "agent.set_model": {
+				const args = [command.agentName, command.model, command.thinkingLevel].filter(Boolean).join(" ");
+				const lines = await executeExtensionCommand("agent.set_model", args);
+				const resolved = lines.map((line) => parseResolvedAgentModelLine(line)).find((entry) => entry !== null);
+				if (!resolved) {
+					return error(id, "agent.set_model", `Unexpected /agent.set_model output: ${lines.join(" | ")}`);
+				}
+				return success(id, "agent.set_model", { resolved });
+			}
+
+			case "agent.set_provider": {
+				const args = [command.agentName, command.provider, command.thinkingLevel].filter(Boolean).join(" ");
+				const lines = await executeExtensionCommand("agent.set_provider", args);
+				const resolved = lines.map((line) => parseResolvedAgentModelLine(line)).find((entry) => entry !== null);
+				if (!resolved) {
+					return error(id, "agent.set_provider", `Unexpected /agent.set_provider output: ${lines.join(" | ")}`);
+				}
+				return success(id, "agent.set_provider", { resolved });
+			}
+
+			case "agent.reset_model": {
+				const lines = await executeExtensionCommand("agent.reset_model", command.agentName);
+				const resolved = lines.map((line) => parseResolvedAgentModelLine(line)).find((entry) => entry !== null);
+				if (!resolved) {
+					return error(id, "agent.reset_model", `Unexpected /agent.reset_model output: ${lines.join(" | ")}`);
+				}
+				return success(id, "agent.reset_model", { resolved });
+			}
+
+			case "agent.list_available_models": {
+				const lines = await executeExtensionCommand("agent.list_available_models", command.provider ?? "");
+				return success(id, "agent.list_available_models", {
+					models: parseAvailableModelLines(lines),
+				});
 			}
 
 			default: {

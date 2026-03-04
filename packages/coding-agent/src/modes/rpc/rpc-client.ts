@@ -12,7 +12,7 @@ import type { AgentDiscoveryRecord, IpcResponse } from "@mariozechner/pi-ipc";
 import type { SessionStats } from "../../core/agent-session.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
-import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.js";
+import type { RpcCommand, RpcResolvedAgentModel, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.js";
 
 // ============================================================================
 // Types
@@ -415,6 +415,44 @@ export class RpcClient {
 	}> {
 		const response = await this.send({ type: "session.mesh.status" });
 		return this.getData(response);
+	}
+
+	async listAgentModels(): Promise<RpcResolvedAgentModel[]> {
+		const response = await this.send({ type: "agent.list_models" });
+		return this.getData<{ agents: RpcResolvedAgentModel[] }>(response).agents;
+	}
+
+	async getAgentModel(agentName: string, category?: string): Promise<RpcResolvedAgentModel> {
+		const response = await this.send({ type: "agent.get_model", agentName, category });
+		return this.getData<{ resolved: RpcResolvedAgentModel }>(response).resolved;
+	}
+
+	async setAgentModel(
+		agentName: string,
+		model: string,
+		thinkingLevel?: ThinkingLevel,
+	): Promise<RpcResolvedAgentModel> {
+		const response = await this.send({ type: "agent.set_model", agentName, model, thinkingLevel });
+		return this.getData<{ resolved: RpcResolvedAgentModel }>(response).resolved;
+	}
+
+	async setAgentProvider(
+		agentName: string,
+		provider: string,
+		thinkingLevel?: ThinkingLevel,
+	): Promise<RpcResolvedAgentModel> {
+		const response = await this.send({ type: "agent.set_provider", agentName, provider, thinkingLevel });
+		return this.getData<{ resolved: RpcResolvedAgentModel }>(response).resolved;
+	}
+
+	async resetAgentModel(agentName: string): Promise<RpcResolvedAgentModel> {
+		const response = await this.send({ type: "agent.reset_model", agentName });
+		return this.getData<{ resolved: RpcResolvedAgentModel }>(response).resolved;
+	}
+
+	async listAgentAvailableModels(provider?: string): Promise<Array<{ provider: string; modelId: string }>> {
+		const response = await this.send({ type: "agent.list_available_models", provider });
+		return this.getData<{ models: Array<{ provider: string; modelId: string }> }>(response).models;
 	}
 
 	// =========================================================================

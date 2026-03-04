@@ -72,7 +72,27 @@ export type RpcCommand =
 	| { id?: string; type: "agent.send"; targetSessionId: string; message: string }
 	| { id?: string; type: "agent.steer"; targetSessionId: string; message: string }
 	| { id?: string; type: "agent.subscribe"; targetSessionId: string; topics: string[] }
-	| { id?: string; type: "session.mesh.status" };
+	| { id?: string; type: "session.mesh.status" }
+
+	// Agent model routing controls
+	| { id?: string; type: "agent.list_models" }
+	| { id?: string; type: "agent.get_model"; agentName: string; category?: string }
+	| {
+			id?: string;
+			type: "agent.set_model";
+			agentName: string;
+			model: string;
+			thinkingLevel?: ThinkingLevel;
+	  }
+	| {
+			id?: string;
+			type: "agent.set_provider";
+			agentName: string;
+			provider: string;
+			thinkingLevel?: ThinkingLevel;
+	  }
+	| { id?: string; type: "agent.reset_model"; agentName: string }
+	| { id?: string; type: "agent.list_available_models"; provider?: string };
 
 // ============================================================================
 // RPC Slash Command (for get_commands response)
@@ -109,6 +129,15 @@ export interface RpcSessionState {
 	autoCompactionEnabled: boolean;
 	messageCount: number;
 	pendingMessageCount: number;
+}
+
+export interface RpcResolvedAgentModel {
+	agentName: string;
+	modelId?: string;
+	provider?: string;
+	thinkingLevel?: ThinkingLevel;
+	resolvedVia?: string;
+	error?: string;
 }
 
 // ============================================================================
@@ -244,6 +273,50 @@ export type RpcResponse =
 			command: "session.mesh.status";
 			success: true;
 			data: { enabled: boolean; running: boolean; sessionId: string; socketPath?: string; aliveAgents: number };
+	  }
+
+	// Agent model routing controls
+	| {
+			id?: string;
+			type: "response";
+			command: "agent.list_models";
+			success: true;
+			data: { agents: RpcResolvedAgentModel[] };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "agent.get_model";
+			success: true;
+			data: { resolved: RpcResolvedAgentModel };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "agent.set_model";
+			success: true;
+			data: { resolved: RpcResolvedAgentModel };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "agent.set_provider";
+			success: true;
+			data: { resolved: RpcResolvedAgentModel };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "agent.reset_model";
+			success: true;
+			data: { resolved: RpcResolvedAgentModel };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "agent.list_available_models";
+			success: true;
+			data: { models: Array<{ provider: string; modelId: string }> };
 	  }
 
 	// Error response (any command can fail)

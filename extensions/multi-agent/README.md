@@ -10,6 +10,12 @@ Phase-1 multi-agent foundation extension.
 - IPC-aware remote delegation path (`task.delegate`) when discovered peer agents are available
 - Lightweight dynamic prompt builder for orchestrator prompts
 - Agent mesh commands: `/agent.discover`, `/agent.send`, `/agent.steer`, `/agent.subscribe`, `/session.mesh.status`
+- Agent model routing commands: `/agent.list_models`, `/agent.get_model`, `/agent.set_model`, `/agent.set_provider`, `/agent.reset_model`, `/agent.list_available_models`
+
+## RPC command coverage (when extension is loaded)
+
+- Mesh: `agent.discover`, `agent.send`, `agent.steer`, `agent.subscribe`, `session.mesh.status`
+- Model routing: `agent.list_models`, `agent.get_model`, `agent.set_model`, `agent.set_provider`, `agent.reset_model`, `agent.list_available_models`
 
 ## Settings
 

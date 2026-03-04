@@ -576,6 +576,42 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 				return success(id, "get_commands", { commands });
 			}
 
+			// =================================================================
+			// Mesh / multi-agent IPC
+			// =================================================================
+
+			case "agent.discover": {
+				return success(id, "agent.discover", { agents: session.getDiscoveredAgents() });
+			}
+
+			case "agent.send": {
+				const response = await session.sendMeshFollowUp(command.targetSessionId, command.message);
+				if (!response.success) {
+					return error(id, "agent.send", response.error ?? "agent_send_failed");
+				}
+				return success(id, "agent.send", { response });
+			}
+
+			case "agent.steer": {
+				const response = await session.sendMeshSteer(command.targetSessionId, command.message);
+				if (!response.success) {
+					return error(id, "agent.steer", response.error ?? "agent_steer_failed");
+				}
+				return success(id, "agent.steer", { response });
+			}
+
+			case "agent.subscribe": {
+				const response = await session.sendMeshSubscribe(command.targetSessionId, command.topics);
+				if (!response.success) {
+					return error(id, "agent.subscribe", response.error ?? "agent_subscribe_failed");
+				}
+				return success(id, "agent.subscribe", { response });
+			}
+
+			case "session.mesh.status": {
+				return success(id, "session.mesh.status", session.getMeshStatus());
+			}
+
 			default: {
 				const unknownCommand = command as { type: string };
 				return error(undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);

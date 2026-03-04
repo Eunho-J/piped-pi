@@ -27,7 +27,16 @@ import type {
 import { Agent as CoreAgent } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@mariozechner/pi-ai";
 import { isContextOverflow, modelsAreEqual, resetApiProviders, supportsXhigh } from "@mariozechner/pi-ai";
-import type { IpcMessage, IpcResponse, TaskProgressMessage, TaskResultMessage } from "@mariozechner/pi-ipc";
+import type {
+	AgentDiscoveryRecord,
+	IpcMessage,
+	IpcResponse,
+	PubSubSubscribeMessage,
+	SessionFollowUpMessage,
+	SessionSteerMessage,
+	TaskProgressMessage,
+	TaskResultMessage,
+} from "@mariozechner/pi-ipc";
 import {
 	AgentDiscovery,
 	AgentIpcClient,
@@ -932,6 +941,90 @@ export class AgentSession {
 	/** IPC socket path for this session (when IPC is enabled). */
 	get ipcSocketPath(): string | undefined {
 		return this._ipcServer?.socketPath;
+	}
+
+	getDiscoveredAgents(): AgentDiscoveryRecord[] {
+		return this._agentDiscovery?.listAlive() ?? [];
+	}
+
+	getMeshStatus(): {
+		enabled: boolean;
+		running: boolean;
+		sessionId: string;
+		socketPath?: string;
+		aliveAgents: number;
+	} {
+		return {
+			enabled: this._enableIpc,
+			running: this._ipcServer?.isRunning() ?? false,
+			sessionId: this.sessionId,
+			socketPath: this.ipcSocketPath,
+			aliveAgents: this.getDiscoveredAgents().length,
+		};
+	}
+
+	async sendMeshFollowUp(targetSessionId: string, message: string): Promise<IpcResponse> {
+		return this._sendMeshMessage(
+			targetSessionId,
+			createIpcMessage<SessionFollowUpMessage>({
+				type: "session.follow_up",
+				payload: {
+					targetSessionId,
+					message,
+					token: "local",
+				},
+				senderSessionId: this.sessionId,
+			}),
+		);
+	}
+
+	async sendMeshSteer(targetSessionId: string, message: string): Promise<IpcResponse> {
+		return this._sendMeshMessage(
+			targetSessionId,
+			createIpcMessage<SessionSteerMessage>({
+				type: "session.steer",
+				payload: {
+					targetSessionId,
+					message,
+					token: "local",
+				},
+				senderSessionId: this.sessionId,
+			}),
+		);
+	}
+
+	async sendMeshSubscribe(targetSessionId: string, topics: string[]): Promise<IpcResponse> {
+		const callbackSocketPath = this.ipcSocketPath ?? this._resolveMeshSocketPath(this.sessionId);
+		return this._sendMeshMessage(
+			targetSessionId,
+			createIpcMessage<PubSubSubscribeMessage>({
+				type: "pubsub.subscribe",
+				payload: {
+					topics,
+					subscriberSessionId: this.sessionId,
+					callbackSocketPath,
+				},
+				senderSessionId: this.sessionId,
+			}),
+		);
+	}
+
+	private _resolveMeshSocketPath(sessionId: string): string {
+		const socketPath = this._agentDiscovery?.getSocketPath(sessionId);
+		if (!socketPath) {
+			throw new Error(`No alive session discovered for ${sessionId}.`);
+		}
+		return socketPath;
+	}
+
+	private async _sendMeshMessage(targetSessionId: string, message: IpcMessage): Promise<IpcResponse> {
+		const socketPath = this._resolveMeshSocketPath(targetSessionId);
+		const client = new AgentIpcClient({ socketPath });
+		try {
+			return await client.send(message);
+		} finally {
+			await client.disconnect();
+		}
 	}
 
 	/** Current session display name, if set */

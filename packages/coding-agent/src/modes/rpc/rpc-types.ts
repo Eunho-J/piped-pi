@@ -7,6 +7,7 @@
 
 import type { AgentMessage, ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { ImageContent, Model } from "@mariozechner/pi-ai";
+import type { AgentDiscoveryRecord, IpcResponse } from "@mariozechner/pi-ipc";
 import type { SessionStats } from "../../core/agent-session.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
@@ -64,7 +65,14 @@ export type RpcCommand =
 	| { id?: string; type: "get_messages" }
 
 	// Commands (available for invocation via prompt)
-	| { id?: string; type: "get_commands" };
+	| { id?: string; type: "get_commands" }
+
+	// Mesh / multi-agent IPC
+	| { id?: string; type: "agent.discover" }
+	| { id?: string; type: "agent.send"; targetSessionId: string; message: string }
+	| { id?: string; type: "agent.steer"; targetSessionId: string; message: string }
+	| { id?: string; type: "agent.subscribe"; targetSessionId: string; topics: string[] }
+	| { id?: string; type: "session.mesh.status" };
 
 // ============================================================================
 // RPC Slash Command (for get_commands response)
@@ -199,6 +207,43 @@ export type RpcResponse =
 			command: "get_commands";
 			success: true;
 			data: { commands: RpcSlashCommand[] };
+	  }
+
+	// Mesh / multi-agent IPC
+	| {
+			id?: string;
+			type: "response";
+			command: "agent.discover";
+			success: true;
+			data: { agents: AgentDiscoveryRecord[] };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "agent.send";
+			success: true;
+			data: { response: IpcResponse };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "agent.steer";
+			success: true;
+			data: { response: IpcResponse };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "agent.subscribe";
+			success: true;
+			data: { response: IpcResponse };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "session.mesh.status";
+			success: true;
+			data: { enabled: boolean; running: boolean; sessionId: string; socketPath?: string; aliveAgents: number };
 	  }
 
 	// Error response (any command can fail)

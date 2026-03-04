@@ -8,6 +8,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import * as readline from "node:readline";
 import type { AgentEvent, AgentMessage, ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { ImageContent } from "@mariozechner/pi-ai";
+import type { AgentDiscoveryRecord, IpcResponse } from "@mariozechner/pi-ipc";
 import type { SessionStats } from "../../core/agent-session.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
@@ -383,6 +384,37 @@ export class RpcClient {
 	async getCommands(): Promise<RpcSlashCommand[]> {
 		const response = await this.send({ type: "get_commands" });
 		return this.getData<{ commands: RpcSlashCommand[] }>(response).commands;
+	}
+
+	async discoverAgents(): Promise<AgentDiscoveryRecord[]> {
+		const response = await this.send({ type: "agent.discover" });
+		return this.getData<{ agents: AgentDiscoveryRecord[] }>(response).agents;
+	}
+
+	async sendAgentMessage(targetSessionId: string, message: string): Promise<IpcResponse> {
+		const response = await this.send({ type: "agent.send", targetSessionId, message });
+		return this.getData<{ response: IpcResponse }>(response).response;
+	}
+
+	async steerAgent(targetSessionId: string, message: string): Promise<IpcResponse> {
+		const response = await this.send({ type: "agent.steer", targetSessionId, message });
+		return this.getData<{ response: IpcResponse }>(response).response;
+	}
+
+	async subscribeAgent(targetSessionId: string, topics: string[]): Promise<IpcResponse> {
+		const response = await this.send({ type: "agent.subscribe", targetSessionId, topics });
+		return this.getData<{ response: IpcResponse }>(response).response;
+	}
+
+	async getMeshStatus(): Promise<{
+		enabled: boolean;
+		running: boolean;
+		sessionId: string;
+		socketPath?: string;
+		aliveAgents: number;
+	}> {
+		const response = await this.send({ type: "session.mesh.status" });
+		return this.getData(response);
 	}
 
 	// =========================================================================

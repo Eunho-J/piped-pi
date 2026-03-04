@@ -20,6 +20,7 @@ export type {
 export { ExtensionRunner } from "./runner.js";
 export type {
 	AgentEndEvent,
+	AgentRegistryAdapter,
 	AgentStartEvent,
 	// Re-exports
 	AgentToolResult,
@@ -123,6 +124,9 @@ export type {
 	SetLabelHandler,
 	SetModelHandler,
 	SetThinkingLevelHandler,
+	SubAgentKeyOverride,
+	SubAgentRunOptions,
+	SubAgentRunResult,
 	TerminalInputHandler,
 	// Events - Tool
 	ToolCallEvent,

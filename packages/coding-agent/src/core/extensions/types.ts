@@ -27,6 +27,7 @@ import type {
 	TextContent,
 	ToolResultMessage,
 } from "@mariozechner/pi-ai";
+import type { AgentDiscovery, AgentIpcClient } from "@mariozechner/pi-ipc";
 import type {
 	AutocompleteItem,
 	Component,
@@ -256,6 +257,45 @@ export interface CompactOptions {
 }
 
 /**
+ * Minimal registry contract exposed to extensions for multi-agent coordination.
+ */
+export interface AgentRegistryAdapter {
+	list(mode?: "primary" | "subagent" | "all", includeAllMode?: boolean): string[];
+	get(name: string): unknown;
+	instantiate?(name: string, model: string): unknown;
+}
+
+export interface SubAgentKeyOverride {
+	provider: string;
+	envVar?: string;
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+export interface SubAgentRunOptions {
+	agentName: string;
+	sessionId?: string;
+	taskId?: string;
+	systemPrompt: string;
+	model: string;
+	tools: string[];
+	prompt: string;
+	thinkingLevel?: ThinkingLevel;
+	inheritMessages?: boolean;
+	ipcForward?: boolean;
+	keyOverride?: SubAgentKeyOverride;
+}
+
+export interface SubAgentRunResult {
+	sessionId: string;
+	finalText: string;
+	tokenUsage: {
+		input: number;
+		output: number;
+	};
+}
+
+/**
  * Context passed to extension event handlers.
  */
 export interface ExtensionContext {
@@ -269,6 +309,14 @@ export interface ExtensionContext {
 	sessionManager: ReadonlySessionManager;
 	/** Model registry for API key resolution */
 	modelRegistry: ModelRegistry;
+	/** Optional multi-agent registry for extension-driven orchestration */
+	agentRegistry?: AgentRegistryAdapter;
+	/** Optional IPC discovery helper for finding alive agent sockets */
+	agentDiscovery?: AgentDiscovery;
+	/** Optional IPC client factory for connecting to discovered sessions */
+	createIpcClient?: (socketPath: string) => AgentIpcClient;
+	/** Optional hook for running sub-agent turns in-process */
+	runSubAgent?: (options: SubAgentRunOptions) => Promise<SubAgentRunResult>;
 	/** Current model (may be undefined) */
 	model: Model<any> | undefined;
 	/** Whether the agent is idle (not streaming) */
@@ -1321,6 +1369,10 @@ export interface ExtensionContextActions {
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (options?: CompactOptions) => void;
 	getSystemPrompt: () => string;
+	getAgentRegistry?: () => AgentRegistryAdapter | undefined;
+	getAgentDiscovery?: () => AgentDiscovery | undefined;
+	createIpcClient?: (socketPath: string) => AgentIpcClient;
+	runSubAgent?: (options: SubAgentRunOptions) => Promise<SubAgentRunResult>;
 }
 
 /**

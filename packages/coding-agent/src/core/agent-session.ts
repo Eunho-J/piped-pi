@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type {
@@ -23,9 +24,18 @@ import type {
 	AgentTool,
 	ThinkingLevel,
 } from "@mariozechner/pi-agent-core";
+import { Agent as CoreAgent } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@mariozechner/pi-ai";
 import { isContextOverflow, modelsAreEqual, resetApiProviders, supportsXhigh } from "@mariozechner/pi-ai";
-import { getDocsPath } from "../config.js";
+import type { IpcMessage, IpcResponse, TaskProgressMessage } from "@mariozechner/pi-ipc";
+import {
+	AgentDiscovery,
+	AgentIpcClient,
+	AgentIpcServer,
+	createIpcMessage,
+	createIpcResponse,
+} from "@mariozechner/pi-ipc";
+import { getAgentDir, getDocsPath } from "../config.js";
 import { theme } from "../modes/interactive/theme/theme.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { sleep } from "../utils/sleep.js";
@@ -44,6 +54,7 @@ import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.js";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.js";
 import {
+	type AgentRegistryAdapter,
 	type ContextUsage,
 	type ExtensionCommandContextActions,
 	type ExtensionErrorListener,
@@ -58,6 +69,8 @@ import {
 	type SessionBeforeSwitchResult,
 	type SessionBeforeTreeResult,
 	type ShutdownHandler,
+	type SubAgentRunOptions,
+	type SubAgentRunResult,
 	type ToolDefinition,
 	type ToolExecutionEndEvent,
 	type ToolExecutionStartEvent,
@@ -148,6 +161,18 @@ export interface AgentSessionConfig {
 	baseToolsOverride?: Record<string, AgentTool>;
 	/** Mutable ref used by Agent to access the current ExtensionRunner */
 	extensionRunnerRef?: { current?: ExtensionRunner };
+	/** Enable per-session IPC socket server */
+	enableIpc?: boolean;
+	/** Optional socket directory override (defaults to ~/.pi/agent/sockets) */
+	ipcSocketDir?: string;
+	/** Optional callback fired after IPC server start */
+	onIpcServerStart?: (server: AgentIpcServer) => void;
+	/** Optional callback fired before fallback IPC routing */
+	onIpcMessage?: (message: IpcMessage) => Promise<IpcResponse>;
+	/** Optional callback fired after IPC server shutdown */
+	onIpcServerStop?: () => void;
+	/** Optional externally-provided agent registry surfaced to extensions */
+	agentRegistry?: AgentRegistryAdapter;
 }
 
 export interface ExtensionBindings {
@@ -265,6 +290,16 @@ export class AgentSession {
 
 	// Model registry for API key resolution
 	private _modelRegistry: ModelRegistry;
+	private _agentRegistry?: AgentRegistryAdapter;
+
+	// IPC integration
+	private _enableIpc = false;
+	private _ipcSocketDir = join(getAgentDir(), "sockets");
+	private _ipcServer?: AgentIpcServer;
+	private _agentDiscovery?: AgentDiscovery;
+	private _onIpcServerStart?: (server: AgentIpcServer) => void;
+	private _onIpcMessage?: (message: IpcMessage) => Promise<IpcResponse>;
+	private _onIpcServerStop?: () => void;
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -283,9 +318,15 @@ export class AgentSession {
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
 		this._modelRegistry = config.modelRegistry;
+		this._agentRegistry = config.agentRegistry;
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._baseToolsOverride = config.baseToolsOverride;
+		this._enableIpc = config.enableIpc ?? false;
+		this._ipcSocketDir = config.ipcSocketDir ?? this._ipcSocketDir;
+		this._onIpcServerStart = config.onIpcServerStart;
+		this._onIpcMessage = config.onIpcMessage;
+		this._onIpcServerStop = config.onIpcServerStop;
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -295,6 +336,10 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
+
+		if (this._enableIpc) {
+			void this.startIpcServer();
+		}
 	}
 
 	/** Model registry for API key resolution and model discovery */
@@ -591,8 +636,85 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		void this.stopIpcServer();
 		this._disconnectFromAgent();
 		this._eventListeners = [];
+	}
+
+	async startIpcServer(): Promise<void> {
+		if (!this._enableIpc || this._ipcServer) {
+			return;
+		}
+
+		this._ipcServer = new AgentIpcServer({
+			sessionId: this.sessionId,
+			socketDir: this._ipcSocketDir,
+			onMessage: async (message) => this._routeIpcMessage(message),
+		});
+		try {
+			await this._ipcServer.start();
+		} catch (error) {
+			this._ipcServer = undefined;
+			throw error;
+		}
+		this._agentDiscovery = new AgentDiscovery({ socketDir: this._ipcSocketDir });
+		this._onIpcServerStart?.(this._ipcServer);
+	}
+
+	async stopIpcServer(): Promise<void> {
+		if (!this._ipcServer) {
+			return;
+		}
+
+		await this._ipcServer.stop();
+		this._ipcServer = undefined;
+		this._agentDiscovery = undefined;
+		this._onIpcServerStop?.();
+	}
+
+	private async _routeIpcMessage(message: IpcMessage): Promise<IpcResponse> {
+		switch (message.type) {
+			case "session.steer": {
+				this.agent.steer(this._createQueuedUserMessage(message.payload.message));
+				return createIpcResponse({
+					id: message.id,
+					success: true,
+					data: { queued: true, queue: "steering" },
+				});
+			}
+			case "session.follow_up": {
+				this.agent.followUp(this._createQueuedUserMessage(message.payload.message));
+				return createIpcResponse({
+					id: message.id,
+					success: true,
+					data: { queued: true, queue: "follow_up" },
+				});
+			}
+			default: {
+				if (this._onIpcMessage) {
+					const response = await this._onIpcMessage(message);
+					return {
+						...response,
+						id: message.id,
+						type: "response",
+						timestamp: response.timestamp ?? new Date().toISOString(),
+					};
+				}
+				return createIpcResponse({
+					id: message.id,
+					success: false,
+					error: `unsupported_ipc_message:${message.type}`,
+				});
+			}
+		}
+	}
+
+	private _createQueuedUserMessage(text: string): AgentMessage {
+		return {
+			role: "user",
+			content: [{ type: "text", text }],
+			timestamp: Date.now(),
+		};
 	}
 
 	// =========================================================================
@@ -699,6 +821,11 @@ export class AgentSession {
 	/** Current session ID */
 	get sessionId(): string {
 		return this.sessionManager.getSessionId();
+	}
+
+	/** IPC socket path for this session (when IPC is enabled). */
+	get ipcSocketPath(): string | undefined {
+		return this._ipcServer?.socketPath;
 	}
 
 	/** Current session display name, if set */
@@ -2045,6 +2172,10 @@ export class AgentSession {
 					})();
 				},
 				getSystemPrompt: () => this.systemPrompt,
+				getAgentRegistry: () => this._agentRegistry,
+				getAgentDiscovery: () => this._agentDiscovery,
+				createIpcClient: (socketPath) => new AgentIpcClient({ socketPath }),
+				runSubAgent: (options) => this.runSubAgent(options),
 			},
 		);
 	}
@@ -2817,6 +2948,177 @@ export class AgentSession {
 	/**
 	 * Get session statistics.
 	 */
+	private _resolveSubAgentModel(modelRef: string, keyOverride?: SubAgentRunOptions["keyOverride"]): Model<any> {
+		const separatorIndex = modelRef.indexOf("/");
+		const parsedProvider = separatorIndex === -1 ? undefined : modelRef.slice(0, separatorIndex);
+		const parsedModelId = separatorIndex === -1 ? modelRef : modelRef.slice(separatorIndex + 1);
+
+		const direct =
+			parsedProvider !== undefined
+				? this.modelRegistry.find(parsedProvider, parsedModelId)
+				: this.modelRegistry.getAll().find((candidate) => candidate.id === parsedModelId);
+		if (!direct) {
+			throw new Error(`Unknown sub-agent model: ${modelRef}`);
+		}
+
+		if (!keyOverride?.baseUrl) {
+			return direct;
+		}
+
+		return {
+			...direct,
+			baseUrl: keyOverride.baseUrl,
+		};
+	}
+
+	private _resolveSubAgentTools(toolNames: string[]): AgentTool[] {
+		if (toolNames.length === 0) {
+			return this.agent.state.tools;
+		}
+
+		const resolved: AgentTool[] = [];
+		for (const toolName of toolNames) {
+			const tool = this._toolRegistry.get(toolName);
+			if (tool) {
+				resolved.push(tool);
+			}
+		}
+		if (resolved.length === 0) {
+			throw new Error(`No valid tools resolved for sub-agent: ${toolNames.join(", ")}`);
+		}
+		return resolved;
+	}
+
+	private _extractAssistantText(message: AssistantMessage | undefined): string {
+		if (!message) {
+			return "";
+		}
+		return message.content
+			.filter(
+				(content): content is Extract<AssistantMessage["content"][number], { type: "text" }> =>
+					content.type === "text",
+			)
+			.map((content) => content.text)
+			.join("")
+			.trim();
+	}
+
+	async runSubAgent(options: SubAgentRunOptions): Promise<SubAgentRunResult> {
+		const sessionId = options.sessionId ?? `sub_${randomUUID()}`;
+		const model = this._resolveSubAgentModel(options.model, options.keyOverride);
+		const tools = this._resolveSubAgentTools(options.tools);
+		const inheritedMessages = options.inheritMessages
+			? this.messages.filter(
+					(message): message is AgentMessage =>
+						message.role === "user" || message.role === "assistant" || message.role === "toolResult",
+				)
+			: [];
+
+		const subAgent = new CoreAgent({
+			sessionId,
+			streamFn: this.agent.streamFn,
+			transport: this.agent.transport,
+			thinkingBudgets: this.agent.thinkingBudgets,
+			maxRetryDelayMs: this.agent.maxRetryDelayMs,
+			getApiKey: async (provider) => {
+				if (options.keyOverride?.provider === provider) {
+					if (options.keyOverride.apiKey) {
+						return options.keyOverride.apiKey;
+					}
+					if (options.keyOverride.envVar) {
+						const envValue = process.env[options.keyOverride.envVar];
+						if (envValue) {
+							return envValue;
+						}
+					}
+				}
+				return this.modelRegistry.getApiKeyForProvider(provider);
+			},
+		});
+
+		subAgent.setModel(model);
+		subAgent.setSystemPrompt(options.systemPrompt);
+		subAgent.setTools(tools);
+		subAgent.setSteeringMode(this.steeringMode);
+		subAgent.setFollowUpMode(this.followUpMode);
+		subAgent.setThinkingLevel(options.thinkingLevel ?? this.thinkingLevel);
+		if (inheritedMessages.length > 0) {
+			subAgent.replaceMessages(inheritedMessages);
+		}
+
+		const taskId = options.taskId ?? sessionId;
+		const unsubscribe =
+			options.ipcForward && this._ipcServer
+				? subAgent.subscribe((event) => {
+						let payload: TaskProgressMessage["payload"] | undefined;
+						switch (event.type) {
+							case "tool_execution_start":
+								payload = {
+									taskId,
+									progressType: "tool_call",
+									message: `Running tool ${event.toolName}`,
+									data: { toolName: event.toolName },
+								};
+								break;
+							case "tool_execution_end":
+								payload = {
+									taskId,
+									progressType: "message",
+									message: event.isError
+										? `Tool ${event.toolName} failed`
+										: `Tool ${event.toolName} completed`,
+									data: { toolName: event.toolName },
+								};
+								break;
+							case "turn_end":
+								payload = {
+									taskId,
+									progressType: "phase_change",
+									message: "Sub-agent completed a turn",
+								};
+								break;
+							case "agent_end":
+								payload = {
+									taskId,
+									progressType: "message",
+									message: "Sub-agent run finished",
+								};
+								break;
+						}
+						if (!payload || !this._ipcServer) {
+							return;
+						}
+						this._ipcServer.broadcast(
+							createIpcMessage<TaskProgressMessage>({
+								type: "task.progress",
+								payload,
+								senderSessionId: this.sessionId,
+							}),
+						);
+					})
+				: undefined;
+
+		try {
+			await subAgent.prompt(options.prompt);
+		} finally {
+			unsubscribe?.();
+		}
+
+		const finalAssistant = subAgent.state.messages
+			.slice()
+			.reverse()
+			.find((message): message is AssistantMessage => message.role === "assistant");
+		const usage = finalAssistant?.usage;
+		return {
+			sessionId,
+			finalText: this._extractAssistantText(finalAssistant),
+			tokenUsage: {
+				input: usage?.input ?? 0,
+				output: usage?.output ?? 0,
+			},
+		};
+	}
+
 	getSessionStats(): SessionStats {
 		const state = this.state;
 		const userMessages = state.messages.filter((m) => m.role === "user").length;

@@ -1,0 +1,38 @@
+{
+	"name": "@pi/multi-agent",
+	"version": "0.55.4",
+	"description": "Multi-agent orchestration extension for pi",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"README.md"
+	],
+	"scripts": {
+		"clean": "rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json",
+		"dev": "tsgo -p tsconfig.build.json --watch --preserveWatchOutput",
+		"test": "vitest --run"
+	},
+	"dependencies": {
+		"@mariozechner/pi-ai": "^0.55.4",
+		"@mariozechner/pi-coding-agent": "^0.55.4",
+		"@mariozechner/pi-ipc": "^0.55.4",
+		"@sinclair/typebox": "^0.34.41"
+	},
+	"devDependencies": {
+		"@types/node": "^24.3.0",
+		"typescript": "^5.7.3",
+		"vitest": "^3.2.4"
+	},
+	"pi": {
+		"extensions": ["./dist/index.js"]
+	}
+}

@@ -50,6 +50,7 @@ export { createEventBus, type EventBus, type EventBusController } from "./core/e
 // Extension system
 export type {
 	AgentEndEvent,
+	AgentRegistryAdapter,
 	AgentStartEvent,
 	AgentToolResult,
 	AgentToolUpdateCallback,
@@ -108,6 +109,9 @@ export type {
 	SlashCommandInfo,
 	SlashCommandLocation,
 	SlashCommandSource,
+	SubAgentKeyOverride,
+	SubAgentRunOptions,
+	SubAgentRunResult,
 	TerminalInputHandler,
 	ToolCallEvent,
 	ToolDefinition,

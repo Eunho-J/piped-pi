@@ -11,6 +11,7 @@ import type { KeyAction, KeybindingsConfig } from "../keybindings.js";
 import type { ModelRegistry } from "../model-registry.js";
 import type { SessionManager } from "../session-manager.js";
 import type {
+	AgentRegistryAdapter,
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
 	CompactOptions,
@@ -41,6 +42,8 @@ import type {
 	SessionBeforeForkResult,
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
+	SubAgentRunOptions,
+	SubAgentRunResult,
 	ToolCallEvent,
 	ToolCallEventResult,
 	ToolResultEvent,
@@ -209,6 +212,10 @@ export class ExtensionRunner {
 	private getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	private compactFn: (options?: CompactOptions) => void = () => {};
 	private getSystemPromptFn: () => string = () => "";
+	private getAgentRegistryFn: () => AgentRegistryAdapter | undefined = () => undefined;
+	private getAgentDiscoveryFn: () => ExtensionContext["agentDiscovery"] | undefined = () => undefined;
+	private createIpcClientFn: ExtensionContext["createIpcClient"] = undefined;
+	private runSubAgentFn: ((options: SubAgentRunOptions) => Promise<SubAgentRunResult>) | undefined = undefined;
 	private newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	private forkHandler: ForkHandler = async () => ({ cancelled: false });
 	private navigateTreeHandler: NavigateTreeHandler = async () => ({ cancelled: false });
@@ -259,6 +266,10 @@ export class ExtensionRunner {
 		this.getContextUsageFn = contextActions.getContextUsage;
 		this.compactFn = contextActions.compact;
 		this.getSystemPromptFn = contextActions.getSystemPrompt;
+		this.getAgentRegistryFn = contextActions.getAgentRegistry ?? (() => undefined);
+		this.getAgentDiscoveryFn = contextActions.getAgentDiscovery ?? (() => undefined);
+		this.createIpcClientFn = contextActions.createIpcClient;
+		this.runSubAgentFn = contextActions.runSubAgent;
 
 		// Flush provider registrations queued during extension loading
 		for (const { name, config } of this.runtime.pendingProviderRegistrations) {
@@ -508,6 +519,10 @@ export class ExtensionRunner {
 			cwd: this.cwd,
 			sessionManager: this.sessionManager,
 			modelRegistry: this.modelRegistry,
+			agentRegistry: this.getAgentRegistryFn(),
+			agentDiscovery: this.getAgentDiscoveryFn(),
+			createIpcClient: this.createIpcClientFn,
+			runSubAgent: this.runSubAgentFn,
 			get model() {
 				return getModel();
 			},

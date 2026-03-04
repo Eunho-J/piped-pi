@@ -1,5 +1,11 @@
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import {
+	createIpcMessage,
+	type PubSubSubscribeMessage,
+	type SessionFollowUpMessage,
+	type SessionSteerMessage,
+} from "@mariozechner/pi-ipc";
 import { registerBuiltInAgents } from "./agents/index.js";
 import { loadMultiAgentConfig } from "./config.js";
 import { TaskDelegator } from "./orchestration/TaskDelegator.js";
@@ -67,6 +73,21 @@ function splitArgs(raw: string): string[] {
 		.filter((value) => value.length > 0);
 }
 
+function splitFirstArg(raw: string): { first: string | undefined; rest: string } {
+	const trimmed = raw.trim();
+	if (trimmed.length === 0) {
+		return { first: undefined, rest: "" };
+	}
+	const firstSpace = trimmed.indexOf(" ");
+	if (firstSpace === -1) {
+		return { first: trimmed, rest: "" };
+	}
+	return {
+		first: trimmed.slice(0, firstSpace),
+		rest: trimmed.slice(firstSpace + 1).trim(),
+	};
+}
+
 function renderAgentList(ctx: ExtensionCommandContext): string {
 	const current = buildRuntime(ctx);
 	return current.registry
@@ -103,6 +124,51 @@ async function renderResolvedAgent(ctx: ExtensionCommandContext, agentName: stri
 	return `${agentName} -> ${resolved.modelId} via ${resolved.resolvedVia}${thinking}`;
 }
 
+async function renderAllResolvedAgents(ctx: ExtensionCommandContext): Promise<string> {
+	const current = buildRuntime(ctx);
+	const lines = await Promise.all(
+		current.registry.list().map(async (agentName) => {
+			try {
+				return await renderResolvedAgent(ctx, agentName);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return `${agentName} -> unresolved (${message})`;
+			}
+		}),
+	);
+	return lines.join("\n");
+}
+
+function resolveTargetSocket(ctx: ExtensionCommandContext, sessionId: string): string {
+	if (!ctx.agentDiscovery) {
+		throw new Error("agentDiscovery is unavailable in this runtime.");
+	}
+	const socketPath = ctx.agentDiscovery.getSocketPath(sessionId);
+	if (!socketPath) {
+		throw new Error(`No alive agent session found for ${sessionId}.`);
+	}
+	return socketPath;
+}
+
+async function sendIpcCommand(
+	ctx: ExtensionCommandContext,
+	socketPath: string,
+	message: SessionSteerMessage | SessionFollowUpMessage | PubSubSubscribeMessage,
+): Promise<void> {
+	if (!ctx.createIpcClient) {
+		throw new Error("createIpcClient() is unavailable in this runtime.");
+	}
+	const client = ctx.createIpcClient(socketPath);
+	try {
+		const response = await client.send(message);
+		if (!response.success) {
+			throw new Error(response.error ?? "ipc_request_failed");
+		}
+	} finally {
+		await client.disconnect();
+	}
+}
+
 export default function multiAgentExtension(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => {
 		buildRuntime(ctx);
@@ -132,6 +198,13 @@ export default function multiAgentExtension(pi: ExtensionAPI): void {
 				throw new Error("Usage: /agent.get_model <agentName> [category]");
 			}
 			console.log(await renderResolvedAgent(ctx, agentName, category));
+		},
+	});
+
+	pi.registerCommand("agent.list_models", {
+		description: "Resolve effective model assignments for all registered agents",
+		handler: async (_args, ctx) => {
+			console.log(await renderAllResolvedAgents(ctx));
 		},
 	});
 
@@ -179,6 +252,139 @@ export default function multiAgentExtension(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			const [provider] = splitArgs(args);
 			console.log(renderModelList(ctx, provider));
+		},
+	});
+
+	pi.registerCommand("agent.list_available_models", {
+		description: "List available models, optionally filtered by provider",
+		handler: async (args, ctx) => {
+			const [provider] = splitArgs(args);
+			console.log(renderModelList(ctx, provider));
+		},
+	});
+
+	pi.registerCommand("agent.discover", {
+		description: "List alive IPC agent sessions discovered from socket metadata",
+		handler: async (_args, ctx) => {
+			if (!ctx.agentDiscovery) {
+				throw new Error("agentDiscovery is unavailable in this runtime.");
+			}
+			const records = ctx.agentDiscovery.listAlive();
+			if (records.length === 0) {
+				console.log("No alive agent sessions discovered.");
+				return;
+			}
+			console.log(
+				records
+					.map(
+						(record) =>
+							`${record.sessionId} socket=${record.socketPath} agent=${record.agentName ?? "unknown"} status=${record.status ?? "unknown"}`,
+					)
+					.join("\n"),
+			);
+		},
+	});
+
+	pi.registerCommand("session.mesh.status", {
+		description: "Show local mesh connectivity summary",
+		handler: async (_args, ctx) => {
+			if (!ctx.agentDiscovery) {
+				console.log("mesh=disabled (agentDiscovery unavailable)");
+				return;
+			}
+			const records = ctx.agentDiscovery.listAlive();
+			const withAgentName = records.filter((record) => record.agentName !== undefined).length;
+			console.log(
+				[
+					`alive_sessions=${records.length}`,
+					`named_agents=${withAgentName}`,
+					`ipc_client_factory=${ctx.createIpcClient ? "available" : "unavailable"}`,
+				].join(" "),
+			);
+		},
+	});
+
+	pi.registerCommand("agent.send", {
+		description: "Send follow-up message to another alive session",
+		handler: async (args, ctx) => {
+			const { first: sessionId, rest: message } = splitFirstArg(args);
+			if (!sessionId || !message) {
+				throw new Error("Usage: /agent.send <targetSessionId> <message>");
+			}
+			const socketPath = resolveTargetSocket(ctx, sessionId);
+			await sendIpcCommand(
+				ctx,
+				socketPath,
+				createIpcMessage<SessionFollowUpMessage>({
+					type: "session.follow_up",
+					payload: {
+						targetSessionId: sessionId,
+						message,
+						token: "local",
+					},
+					senderSessionId: ctx.sessionManager.getSessionId(),
+				}),
+			);
+			console.log(`sent follow-up to ${sessionId}`);
+		},
+	});
+
+	pi.registerCommand("agent.steer", {
+		description: "Send steering message to another alive session",
+		handler: async (args, ctx) => {
+			const { first: sessionId, rest: message } = splitFirstArg(args);
+			if (!sessionId || !message) {
+				throw new Error("Usage: /agent.steer <targetSessionId> <message>");
+			}
+			const socketPath = resolveTargetSocket(ctx, sessionId);
+			await sendIpcCommand(
+				ctx,
+				socketPath,
+				createIpcMessage<SessionSteerMessage>({
+					type: "session.steer",
+					payload: {
+						targetSessionId: sessionId,
+						message,
+						token: "local",
+					},
+					senderSessionId: ctx.sessionManager.getSessionId(),
+				}),
+			);
+			console.log(`sent steer message to ${sessionId}`);
+		},
+	});
+
+	pi.registerCommand("agent.subscribe", {
+		description: "Send pub/sub subscription request to target session",
+		handler: async (args, ctx) => {
+			const [sessionId, topicsRaw] = splitArgs(args);
+			if (!sessionId || !topicsRaw) {
+				throw new Error("Usage: /agent.subscribe <targetSessionId> <topic[,topic2,...]>");
+			}
+			const topics = topicsRaw
+				.split(",")
+				.map((topic) => topic.trim())
+				.filter((topic) => topic.length > 0);
+			if (topics.length === 0) {
+				throw new Error("At least one topic is required.");
+			}
+
+			const socketPath = resolveTargetSocket(ctx, sessionId);
+			const callbackSocketPath = resolveTargetSocket(ctx, ctx.sessionManager.getSessionId());
+			await sendIpcCommand(
+				ctx,
+				socketPath,
+				createIpcMessage<PubSubSubscribeMessage>({
+					type: "pubsub.subscribe",
+					payload: {
+						topics,
+						subscriberSessionId: ctx.sessionManager.getSessionId(),
+						callbackSocketPath,
+					},
+					senderSessionId: ctx.sessionManager.getSessionId(),
+				}),
+			);
+			console.log(`subscription request sent to ${sessionId} for topics: ${topics.join(", ")}`);
 		},
 	});
 }

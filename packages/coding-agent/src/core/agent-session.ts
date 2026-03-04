@@ -27,7 +27,7 @@ import type {
 import { Agent as CoreAgent } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@mariozechner/pi-ai";
 import { isContextOverflow, modelsAreEqual, resetApiProviders, supportsXhigh } from "@mariozechner/pi-ai";
-import type { IpcMessage, IpcResponse, TaskProgressMessage } from "@mariozechner/pi-ipc";
+import type { IpcMessage, IpcResponse, TaskProgressMessage, TaskResultMessage } from "@mariozechner/pi-ipc";
 import {
 	AgentDiscovery,
 	AgentIpcClient,
@@ -173,6 +173,8 @@ export interface AgentSessionConfig {
 	onIpcServerStop?: () => void;
 	/** Optional externally-provided agent registry surfaced to extensions */
 	agentRegistry?: AgentRegistryAdapter;
+	/** Optional explicit agent name advertised over IPC discovery metadata */
+	agentName?: string;
 }
 
 export interface ExtensionBindings {
@@ -291,6 +293,7 @@ export class AgentSession {
 	// Model registry for API key resolution
 	private _modelRegistry: ModelRegistry;
 	private _agentRegistry?: AgentRegistryAdapter;
+	private _agentName?: string;
 
 	// IPC integration
 	private _enableIpc = false;
@@ -319,6 +322,7 @@ export class AgentSession {
 		this._cwd = config.cwd;
 		this._modelRegistry = config.modelRegistry;
 		this._agentRegistry = config.agentRegistry;
+		this._agentName = config.agentName;
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._baseToolsOverride = config.baseToolsOverride;
@@ -650,6 +654,9 @@ export class AgentSession {
 			sessionId: this.sessionId,
 			socketDir: this._ipcSocketDir,
 			onMessage: async (message) => this._routeIpcMessage(message),
+			agentName: this._agentName ?? this.sessionName ?? "agent",
+			status: "idle",
+			currentModel: this._currentModelRef(),
 		});
 		try {
 			await this._ipcServer.start();
@@ -690,6 +697,57 @@ export class AgentSession {
 					data: { queued: true, queue: "follow_up" },
 				});
 			}
+			case "task.delegate": {
+				const startedAt = Date.now();
+				const targetModel = message.payload.model ?? this._currentModelRef();
+				if (!targetModel) {
+					return createIpcResponse({
+						id: message.id,
+						success: false,
+						error: "task_delegate_requires_model",
+					});
+				}
+
+				const registeredAgent = this._resolveTaskDelegateAgentConfig(message.payload.agentName, targetModel);
+				const result = await this.runSubAgent({
+					agentName: message.payload.agentName ?? this._agentName ?? "sisyphus-junior",
+					sessionId: message.payload.sessionId,
+					taskId: message.payload.taskId,
+					systemPrompt: registeredAgent?.systemPrompt ?? this.systemPrompt,
+					model: targetModel,
+					tools: registeredAgent?.tools ?? this.getActiveToolNames(),
+					prompt: message.payload.prompt,
+					thinkingLevel: registeredAgent?.defaultThinkingLevel ?? this.thinkingLevel,
+					inheritMessages: false,
+					ipcForward: true,
+				});
+
+				this._ipcServer?.broadcast(
+					createIpcMessage<TaskResultMessage>({
+						type: "task.result",
+						payload: {
+							taskId: message.payload.taskId,
+							sessionId: result.sessionId,
+							success: true,
+							output: result.finalText,
+							tokenUsage: result.tokenUsage,
+							durationMs: Date.now() - startedAt,
+						},
+						senderSessionId: this.sessionId,
+					}),
+				);
+
+				return createIpcResponse({
+					id: message.id,
+					success: true,
+					data: {
+						taskId: message.payload.taskId,
+						sessionId: result.sessionId,
+						output: result.finalText,
+						tokenUsage: result.tokenUsage,
+					},
+				});
+			}
 			default: {
 				if (this._onIpcMessage) {
 					const response = await this._onIpcMessage(message);
@@ -715,6 +773,54 @@ export class AgentSession {
 			content: [{ type: "text", text }],
 			timestamp: Date.now(),
 		};
+	}
+
+	private _currentModelRef(): string | undefined {
+		return this.model ? `${this.model.provider}/${this.model.id}` : undefined;
+	}
+
+	private _resolveTaskDelegateAgentConfig(
+		agentName: string | undefined,
+		model: string,
+	):
+		| {
+				systemPrompt: string;
+				tools: string[];
+				defaultThinkingLevel?: ThinkingLevel;
+		  }
+		| undefined {
+		if (!agentName || !this._agentRegistry?.instantiate) {
+			return undefined;
+		}
+
+		try {
+			const candidate = this._agentRegistry.instantiate(agentName, model);
+			if (typeof candidate !== "object" || candidate === null) {
+				return undefined;
+			}
+
+			const record = candidate as Record<string, unknown>;
+			if (typeof record.systemPrompt !== "string" || !Array.isArray(record.tools)) {
+				return undefined;
+			}
+			const tools = record.tools.filter((tool): tool is string => typeof tool === "string");
+			if (tools.length === 0) {
+				return undefined;
+			}
+
+			const defaultThinkingLevel =
+				typeof record.defaultThinkingLevel === "string" &&
+				THINKING_LEVELS_WITH_XHIGH.includes(record.defaultThinkingLevel as ThinkingLevel)
+					? (record.defaultThinkingLevel as ThinkingLevel)
+					: undefined;
+			return {
+				systemPrompt: record.systemPrompt,
+				tools,
+				defaultThinkingLevel,
+			};
+		} catch {
+			return undefined;
+		}
 	}
 
 	// =========================================================================
@@ -1438,6 +1544,7 @@ export class AgentSession {
 
 		// Re-clamp thinking level for new model's capabilities
 		this.setThinkingLevel(this.thinkingLevel);
+		this._ipcServer?.updateMetadata({ currentModel: this._currentModelRef() });
 
 		await this._emitModelSelect(model, previousModel, "set");
 	}
@@ -1496,6 +1603,7 @@ export class AgentSession {
 
 		// Apply thinking level (setThinkingLevel clamps to model capabilities)
 		this.setThinkingLevel(next.thinkingLevel);
+		this._ipcServer?.updateMetadata({ currentModel: this._currentModelRef() });
 
 		await this._emitModelSelect(next.model, currentModel, "cycle");
 
@@ -1525,6 +1633,7 @@ export class AgentSession {
 
 		// Re-clamp thinking level for new model's capabilities
 		this.setThinkingLevel(this.thinkingLevel);
+		this._ipcServer?.updateMetadata({ currentModel: this._currentModelRef() });
 
 		await this._emitModelSelect(nextModel, currentModel, "cycle");
 
@@ -2623,6 +2732,7 @@ export class AgentSession {
 			);
 			if (match) {
 				this.agent.setModel(match);
+				this._ipcServer?.updateMetadata({ currentModel: this._currentModelRef() });
 				await this._emitModelSelect(match, previousModel, "restore");
 			}
 		}

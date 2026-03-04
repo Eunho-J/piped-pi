@@ -1,8 +1,8 @@
-import { chmodSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, join } from "node:path";
 import { createIpcResponse } from "./messages.js";
-import type { IpcInboundMessage, IpcMessage, IpcRequestHandler, IpcResponse } from "./types.js";
+import type { AgentDiscoveryRecord, IpcInboundMessage, IpcMessage, IpcRequestHandler, IpcResponse } from "./types.js";
 
 export interface AgentIpcServerOptions {
 	sessionId: string;
@@ -10,6 +10,11 @@ export interface AgentIpcServerOptions {
 	socketDir?: string;
 	socketPath?: string;
 	onClientMessage?: (message: IpcMessage) => void;
+	agentName?: string;
+	status?: "idle" | "running" | "busy";
+	capabilities?: string[];
+	currentModel?: string;
+	parentSessionId?: string;
 }
 
 function defaultSocketDir(): string {
@@ -42,6 +47,7 @@ export class AgentIpcServer {
 
 	private readonly onMessage: IpcRequestHandler;
 	private readonly onClientMessage?: (message: IpcMessage) => void;
+	private readonly metadata: Omit<AgentDiscoveryRecord, "sessionId" | "socketPath" | "updatedAt">;
 	private readonly sockets = new Set<Socket>();
 	private server?: Server;
 
@@ -50,6 +56,13 @@ export class AgentIpcServer {
 		this.socketPath = options.socketPath ?? deriveSocketPath(options.sessionId, options.socketDir);
 		this.onMessage = options.onMessage;
 		this.onClientMessage = options.onClientMessage;
+		this.metadata = {
+			agentName: options.agentName,
+			status: options.status,
+			capabilities: options.capabilities,
+			currentModel: options.currentModel,
+			parentSessionId: options.parentSessionId,
+		};
 	}
 
 	async start(): Promise<void> {
@@ -72,6 +85,7 @@ export class AgentIpcServer {
 			this.server?.listen(this.socketPath, () => resolve());
 		});
 		chmodSync(this.socketPath, 0o600);
+		this.writeMetadata();
 	}
 
 	private handleConnection(socket: Socket): void {
@@ -156,6 +170,10 @@ export class AgentIpcServer {
 		if (existsSync(this.socketPath)) {
 			rmSync(this.socketPath, { force: true });
 		}
+		const metadataPath = this.getMetadataPath();
+		if (existsSync(metadataPath)) {
+			rmSync(metadataPath, { force: true });
+		}
 	}
 
 	broadcast(message: IpcMessage): void {
@@ -178,6 +196,26 @@ export class AgentIpcServer {
 			socketName: basename(this.socketPath),
 			clientCount: this.sockets.size,
 		};
+	}
+
+	updateMetadata(metadata: Partial<Omit<AgentDiscoveryRecord, "sessionId" | "socketPath" | "updatedAt">>): void {
+		Object.assign(this.metadata, metadata);
+		if (this.isRunning()) {
+			this.writeMetadata();
+		}
+	}
+
+	private getMetadataPath(): string {
+		return `${this.socketPath}.json`;
+	}
+
+	private writeMetadata(): void {
+		const payload = {
+			...this.metadata,
+			sessionId: this.sessionId,
+			socketPath: this.socketPath,
+		};
+		writeFileSync(this.getMetadataPath(), JSON.stringify(payload, null, "\t"));
 	}
 }
 

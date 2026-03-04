@@ -1,6 +1,6 @@
 import { getEditorKeybindings } from "../keybindings.js";
 import type { Component } from "../tui.js";
-import { truncateToWidth } from "../utils.js";
+import { truncateToWidth, visibleWidth } from "../utils.js";
 
 const normalizeToSingleLine = (text: string): string => text.replace(/[\r\n]+/g, " ").trim();
 
@@ -77,17 +77,19 @@ export class SelectList implements Component {
 			let line = "";
 			if (isSelected) {
 				// Use arrow indicator for selection - entire line uses selectedText color
-				const prefixWidth = 2; // "→ " is 2 characters visually
+				const prefixWidth = visibleWidth("→ ");
 				const displayValue = item.label || item.value;
 
 				if (descriptionSingleLine && width > 40) {
 					// Calculate how much space we have for value + description
-					const maxValueWidth = Math.min(30, width - prefixWidth - 4);
+					const maxValueWidth = Math.max(1, Math.min(30, width - prefixWidth - 4));
 					const truncatedValue = truncateToWidth(displayValue, maxValueWidth, "");
-					const spacing = " ".repeat(Math.max(1, 32 - truncatedValue.length));
+					const truncatedValueWidth = visibleWidth(truncatedValue);
+					const spacingWidth = Math.max(1, 32 - truncatedValueWidth);
+					const spacing = " ".repeat(spacingWidth);
 
 					// Calculate remaining space for description using visible widths
-					const descriptionStart = prefixWidth + truncatedValue.length + spacing.length;
+					const descriptionStart = prefixWidth + truncatedValueWidth + spacingWidth;
 					const remainingWidth = width - descriptionStart - 2; // -2 for safety
 
 					if (remainingWidth > 10) {
@@ -107,15 +109,18 @@ export class SelectList implements Component {
 			} else {
 				const displayValue = item.label || item.value;
 				const prefix = "  ";
+				const prefixWidth = visibleWidth(prefix);
 
 				if (descriptionSingleLine && width > 40) {
 					// Calculate how much space we have for value + description
-					const maxValueWidth = Math.min(30, width - prefix.length - 4);
+					const maxValueWidth = Math.max(1, Math.min(30, width - prefixWidth - 4));
 					const truncatedValue = truncateToWidth(displayValue, maxValueWidth, "");
-					const spacing = " ".repeat(Math.max(1, 32 - truncatedValue.length));
+					const truncatedValueWidth = visibleWidth(truncatedValue);
+					const spacingWidth = Math.max(1, 32 - truncatedValueWidth);
+					const spacing = " ".repeat(spacingWidth);
 
 					// Calculate remaining space for description
-					const descriptionStart = prefix.length + truncatedValue.length + spacing.length;
+					const descriptionStart = prefixWidth + truncatedValueWidth + spacingWidth;
 					const remainingWidth = width - descriptionStart - 2; // -2 for safety
 
 					if (remainingWidth > 10) {
@@ -124,12 +129,12 @@ export class SelectList implements Component {
 						line = prefix + truncatedValue + descText;
 					} else {
 						// Not enough space for description
-						const maxWidth = width - prefix.length - 2;
+						const maxWidth = width - prefixWidth - 2;
 						line = prefix + truncateToWidth(displayValue, maxWidth, "");
 					}
 				} else {
 					// No description or not enough width
-					const maxWidth = width - prefix.length - 2;
+					const maxWidth = width - prefixWidth - 2;
 					line = prefix + truncateToWidth(displayValue, maxWidth, "");
 				}
 			}

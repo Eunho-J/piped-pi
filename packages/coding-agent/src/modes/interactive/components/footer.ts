@@ -26,6 +26,68 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1000000)}M`;
 }
 
+const ansiRegex = /\x1b\[[0-9;]*m/g;
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+function stripAnsi(text: string): string {
+	return text.replace(ansiRegex, "");
+}
+
+function truncateMiddleToWidth(text: string, maxWidth: number, ellipsis = "..."): string {
+	if (maxWidth <= 0) {
+		return "";
+	}
+	if (visibleWidth(text) <= maxWidth) {
+		return text;
+	}
+
+	const ellipsisWidth = visibleWidth(ellipsis);
+	if (ellipsisWidth >= maxWidth) {
+		return truncateToWidth(ellipsis, maxWidth, "");
+	}
+
+	const availableWidth = maxWidth - ellipsisWidth;
+	const segments = Array.from(graphemeSegmenter.segment(text), ({ segment }) => segment);
+
+	let startText = "";
+	let endText = "";
+	let startWidth = 0;
+	let endWidth = 0;
+	let left = 0;
+	let right = segments.length - 1;
+
+	while (left <= right) {
+		const takeStart = startWidth <= endWidth;
+		if (takeStart) {
+			const segment = segments[left];
+			if (!segment) {
+				break;
+			}
+			const segmentWidth = visibleWidth(segment);
+			if (startWidth + endWidth + segmentWidth > availableWidth) {
+				break;
+			}
+			startText += segment;
+			startWidth += segmentWidth;
+			left += 1;
+		} else {
+			const segment = segments[right];
+			if (!segment) {
+				break;
+			}
+			const segmentWidth = visibleWidth(segment);
+			if (startWidth + endWidth + segmentWidth > availableWidth) {
+				break;
+			}
+			endText = segment + endText;
+			endWidth += segmentWidth;
+			right -= 1;
+		}
+	}
+
+	return `${startText}${ellipsis}${endText}`;
+}
+
 /**
  * Footer component that shows pwd, token stats, and context usage.
  * Computes token/context stats from session, gets git branch and extension statuses from provider.
@@ -105,15 +167,8 @@ export class FooterComponent implements Component {
 		}
 
 		// Truncate path if too long to fit width
-		if (pwd.length > width) {
-			const half = Math.floor(width / 2) - 2;
-			if (half > 1) {
-				const start = pwd.slice(0, half);
-				const end = pwd.slice(-(half - 1));
-				pwd = `${start}...${end}`;
-			} else {
-				pwd = pwd.slice(0, Math.max(1, width));
-			}
+		if (visibleWidth(pwd) > width) {
+			pwd = truncateMiddleToWidth(pwd, width);
 		}
 
 		// Build stats line
@@ -156,8 +211,8 @@ export class FooterComponent implements Component {
 		// If statsLeft is too wide, truncate it
 		if (statsLeftWidth > width) {
 			// Truncate statsLeft to fit width (no room for right side)
-			const plainStatsLeft = statsLeft.replace(/\x1b\[[0-9;]*m/g, "");
-			statsLeft = `${plainStatsLeft.substring(0, width - 3)}...`;
+			const plainStatsLeft = stripAnsi(statsLeft);
+			statsLeft = truncateToWidth(plainStatsLeft, width, "...");
 			statsLeftWidth = visibleWidth(statsLeft);
 		}
 
@@ -193,13 +248,13 @@ export class FooterComponent implements Component {
 		} else {
 			// Need to truncate right side
 			const availableForRight = width - statsLeftWidth - minPadding;
-			if (availableForRight > 3) {
-				// Truncate to fit (strip ANSI codes for length calculation, then truncate raw string)
-				const plainRightSide = rightSide.replace(/\x1b\[[0-9;]*m/g, "");
-				const truncatedPlain = plainRightSide.substring(0, availableForRight);
-				// For simplicity, just use plain truncated version (loses color, but fits)
-				const padding = " ".repeat(width - statsLeftWidth - truncatedPlain.length);
-				statsLine = statsLeft + padding + truncatedPlain;
+			if (availableForRight > 0) {
+				// Truncate to fit (strip ANSI codes first; right side is plain text anyway)
+				const plainRightSide = stripAnsi(rightSide);
+				const truncatedRight = truncateToWidth(plainRightSide, availableForRight, "");
+				const truncatedRightWidth = visibleWidth(truncatedRight);
+				const padding = " ".repeat(Math.max(minPadding, width - statsLeftWidth - truncatedRightWidth));
+				statsLine = statsLeft + padding + truncatedRight;
 			} else {
 				// Not enough space for right side at all
 				statsLine = statsLeft;

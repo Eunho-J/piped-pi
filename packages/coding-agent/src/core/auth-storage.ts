@@ -21,6 +21,11 @@ import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
 import { resolveConfigValue } from "./resolve-config-value.js";
 
+const AUTH_PROVIDER_FALLBACKS: Record<string, string[]> = {
+	// ChatGPT Plan (openai-codex) can use OpenAI API keys as a fallback.
+	"openai-codex": ["openai"],
+};
+
 export type ApiKeyCredential = {
 	type: "api_key";
 	key: string;
@@ -297,10 +302,12 @@ export class AuthStorage {
 	 * Unlike getApiKey(), this doesn't refresh OAuth tokens.
 	 */
 	hasAuth(provider: string): boolean {
-		if (this.runtimeOverrides.has(provider)) return true;
-		if (this.data[provider]) return true;
-		if (getEnvApiKey(provider)) return true;
-		if (this.fallbackResolver?.(provider)) return true;
+		for (const candidate of this.getProviderCandidates(provider)) {
+			if (this.runtimeOverrides.has(candidate)) return true;
+			if (this.data[candidate]) return true;
+			if (getEnvApiKey(candidate)) return true;
+			if (this.fallbackResolver?.(candidate)) return true;
+		}
 		return false;
 	}
 
@@ -395,8 +402,24 @@ export class AuthStorage {
 	 * 3. OAuth token from auth.json (auto-refreshed with locking)
 	 * 4. Environment variable
 	 * 5. Fallback resolver (models.json custom providers)
+	 *
+	 * For providers with configured fallbacks (for example `openai-codex`),
+	 * this order is applied to the provider first, then each fallback provider.
 	 */
 	async getApiKey(providerId: string): Promise<string | undefined> {
+		for (const candidate of this.getProviderCandidates(providerId)) {
+			const apiKey = await this.getApiKeyForProvider(candidate);
+			if (apiKey) return apiKey;
+		}
+		return undefined;
+	}
+
+	private getProviderCandidates(providerId: string): string[] {
+		const fallbacks = AUTH_PROVIDER_FALLBACKS[providerId] ?? [];
+		return [providerId, ...fallbacks.filter((candidate) => candidate !== providerId)];
+	}
+
+	private async getApiKeyForProvider(providerId: string): Promise<string | undefined> {
 		// Runtime override takes highest priority
 		const runtimeKey = this.runtimeOverrides.get(providerId);
 		if (runtimeKey) {

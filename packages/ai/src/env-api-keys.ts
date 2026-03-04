@@ -51,7 +51,7 @@ function hasVertexAdcCredentials(): boolean {
 /**
  * Get API key for provider from known environment variables, e.g. OPENAI_API_KEY.
  *
- * Will not return API keys for providers that require OAuth tokens.
+ * OAuth-first providers may optionally define API-key fallbacks (for example openai-codex -> OPENAI_API_KEY).
  */
 export function getEnvApiKey(provider: KnownProvider): string | undefined;
 export function getEnvApiKey(provider: string): string | undefined;
@@ -100,6 +100,8 @@ export function getEnvApiKey(provider: any): string | undefined {
 
 	const envMap: Record<string, string> = {
 		openai: "OPENAI_API_KEY",
+		// Fallback for OpenAI Codex provider when using OpenAI API keys instead of ChatGPT OAuth tokens.
+		"openai-codex": "OPENAI_API_KEY",
 		"azure-openai-responses": "AZURE_OPENAI_API_KEY",
 		google: "GEMINI_API_KEY",
 		groq: "GROQ_API_KEY",
